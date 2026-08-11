@@ -29,6 +29,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import express from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
@@ -74,6 +75,212 @@ if (!process.env.MCP_API_TOKEN) {
     "⚠️  MCP_API_TOKEN не задан — используется токен по умолчанию. " +
     "Смените переменную окружения перед публичным деплоем!"
   );
+}
+
+// ── Адаптивные уточняющие вопросы ────────────────────────────────────────────
+
+/**
+ * Пул всех возможных уточняющих вопросов, сгруппированных по категориям.
+ * Каждый вопрос имеет:
+ *   - id         — уникальный идентификатор
+ *   - category   — группа (base / finance / transport / warehouse / accounting / procurement)
+ *   - question   — текст вопроса для пользователя
+ *   - hint       — подсказка агенту как использовать ответ
+ *   - keywords   — слова в request_text, при наличии которых вопрос становится релевантным
+ *   - priority   — чем ниже число, тем выше приоритет при выборе
+ */
+const QUESTION_POOL = [
+  // ── Базовые (всегда релевантны) ────────────────────────────────────────────
+  {
+    id: "q_job_title",
+    category: "base",
+    question: "Какова точная должность сотрудника (например: бухгалтер, кладовщик, механик, диспетчер)?",
+    hint: "Определяет базовый набор профилей",
+    keywords: [],
+    priority: 1,
+  },
+  {
+    id: "q_department",
+    category: "base",
+    question: "В каком отделе/подразделении работает сотрудник (например: бухгалтерия, склад, АТО, сметный отдел)?",
+    hint: "Уточняет принадлежность к подразделению",
+    keywords: [],
+    priority: 2,
+  },
+  {
+    id: "q_is_new",
+    category: "base",
+    question: "Это новый сотрудник или замена уволившегося (если замена — у кого были аналогичные права)?",
+    hint: "Позволяет скопировать набор профилей от предшественника",
+    keywords: [],
+    priority: 10,
+  },
+  // ── Финансы / Казначейство ─────────────────────────────────────────────────
+  {
+    id: "q_payments",
+    category: "finance",
+    question: "Сотрудник будет работать с платежами или банковскими операциями (заявки на оплату, платёжные поручения)?",
+    hint: "Требует профиль казначея или согласования главбуха",
+    keywords: ["казначей", "казначейств", "платёж", "платеж", "банк", "оплат", "финанс", "деньг", "счёт", "счет", "платёжн", "платежн"],
+    priority: 3,
+  },
+  {
+    id: "q_budget",
+    category: "finance",
+    question: "Нужен ли доступ к бюджетированию или согласованию лимитов расходов?",
+    hint: "Требует роли планирования/бюджета",
+    keywords: ["бюджет", "лимит", "план", "финанс", "казначей"],
+    priority: 5,
+  },
+  // ── Бухгалтерский / Налоговый учёт ────────────────────────────────────────
+  {
+    id: "q_accounting_type",
+    category: "accounting",
+    question: "Сотрудник ведёт бухгалтерский/налоговый учёт (проводки, регистры) или только просматривает данные?",
+    hint: "Ведение требует профили БУ/НУ и согласования главбуха",
+    keywords: ["бухгалт", "учёт", "учет", "проводк", "налог", "ну ", "бу ", "главбух", "счета"],
+    priority: 3,
+  },
+  {
+    id: "q_salary",
+    category: "accounting",
+    question: "Нужен ли доступ к расчёту зарплаты или кадровым данным сотрудников?",
+    hint: "Требует профиль расчётчика зарплаты",
+    keywords: ["зарплат", "зп", "кадр", "сотрудник", "персонал", "расчёт", "расчет", "оклад"],
+    priority: 6,
+  },
+  // ── Транспорт / ГСМ ───────────────────────────────────────────────────────
+  {
+    id: "q_waybills",
+    category: "transport",
+    question: "Сотрудник будет оформлять путевые листы или работать с транспортными средствами?",
+    hint: "Требует транспортные профили и согласования рук. АТ",
+    keywords: ["путевой", "путевых", "путёвк", "путевк", "транспорт", "водитель", "авто", "тс", "механик", "ато", "диспетчер"],
+    priority: 3,
+  },
+  {
+    id: "q_fuel",
+    category: "transport",
+    question: "Нужен ли доступ к учёту ГСМ (заправки, поправочные коэффициенты, ведомости топлива)?",
+    hint: "Требует специфические роли учёта топлива",
+    keywords: ["гсм", "топлив", "заправк", "бензин", "дизель", "ведомость", "нормы расхода"],
+    priority: 4,
+  },
+  {
+    id: "q_transport_repair",
+    category: "transport",
+    question: "Будет ли сотрудник работать с ремонтом техники или технического обслуживания (ТО)?",
+    hint: "Требует профили сервисной службы/механика",
+    keywords: ["ремонт", "то ", "техобслужив", "механик", "мастер"],
+    priority: 7,
+  },
+  // ── Склад / МПЗ ───────────────────────────────────────────────────────────
+  {
+    id: "q_warehouse_type",
+    category: "warehouse",
+    question: "На каком складе работает сотрудник (основной материальный, инструментальный, другой) и какие операции: приём или отпуск?",
+    hint: "Уточняет тип складского профиля (кладовщик/старший кладовщик)",
+    keywords: ["склад", "кладовщик", "мпз", "материал", "приходн", "расходн", "ордер", "тмц"],
+    priority: 3,
+  },
+  {
+    id: "q_inventory",
+    category: "warehouse",
+    question: "Нужен ли доступ к инвентаризации или контролю остатков?",
+    hint: "Требует роли инвентаризации",
+    keywords: ["инвентаризац", "остатк", "излишк", "недостач", "пересчёт"],
+    priority: 6,
+  },
+  // ── Закупки / Договоры ────────────────────────────────────────────────────
+  {
+    id: "q_contracts",
+    category: "procurement",
+    question: "Будет ли сотрудник работать с договорами с поставщиками или подрядчиками?",
+    hint: "Требует профили договорного отдела",
+    keywords: ["договор", "контракт", "поставщик", "подрядчик", "закупк", "тендер", "снабжен"],
+    priority: 4,
+  },
+  {
+    id: "q_purchase_orders",
+    category: "procurement",
+    question: "Нужно ли оформлять заявки на закупку МПЗ или счета на оплату от поставщиков?",
+    hint: "Требует профили снабженца/менеджера по закупкам",
+    keywords: ["заявк", "закупк", "снабжен", "поставк", "счёт-фактур", "счет-фактур"],
+    priority: 5,
+  },
+];
+
+/**
+ * Анализирует request_text и выбирает 5 наиболее релевантных вопросов.
+ * Логика:
+ *   1. Всегда включаем вопросы с пустым keywords (базовые), если их < 2
+ *   2. Вычисляем "вес" каждого вопроса по числу совпадений keywords с request_text
+ *   3. Сортируем по весу (релевантность) + priority, берём топ-5
+ *
+ * @param {string} requestText
+ * @returns {{ id, question, hint, category }[]} — ровно 5 вопросов
+ */
+function buildAdaptiveQuestions(requestText) {
+  const text = (requestText || "").toLowerCase();
+
+  // Считаем релевантность каждого вопроса
+  const scored = QUESTION_POOL.map((q) => {
+    const hits = q.keywords.filter((kw) => text.includes(kw.toLowerCase())).length;
+    const isBase = q.keywords.length === 0;
+    return { q, hits, isBase };
+  });
+
+  // Разделяем базовые и тематические
+  const base = scored.filter((s) => s.isBase).sort((a, b) => a.q.priority - b.q.priority);
+  const thematic = scored
+    .filter((s) => !s.isBase)
+    .sort((a, b) => {
+      // Сначала те, у кого есть совпадения; внутри — по hits (больше = лучше), затем по priority
+      if (b.hits !== a.hits) return b.hits - a.hits;
+      return a.q.priority - b.q.priority;
+    });
+
+  // Берём 2 базовых + 3 тематических (или заполняем базовыми если тематических нет)
+  const selected = [];
+  const baseNeeded = 2;
+  selected.push(...base.slice(0, baseNeeded).map((s) => s.q));
+
+  const thematicNeeded = 5 - selected.length;
+  selected.push(...thematic.slice(0, thematicNeeded).map((s) => s.q));
+
+  // Если тематических не хватило — добираем базовыми
+  if (selected.length < 5) {
+    const usedIds = new Set(selected.map((q) => q.id));
+    const extraBase = base.filter((s) => !usedIds.has(s.q.id)).map((s) => s.q);
+    selected.push(...extraBase.slice(0, 5 - selected.length));
+  }
+
+  return selected.slice(0, 5).map(({ id, question, hint, category }) => ({
+    id,
+    category,
+    question,
+    hint,
+  }));
+}
+
+/**
+ * Обогащает исходный request_text ответами пользователя на уточняющие вопросы.
+ * Формирует расширенную строку контекста, которая улучшает точность подбора профиля.
+ *
+ * @param {string} requestText — исходное описание
+ * @param {{ id, question }[]} questions — заданные вопросы
+ * @param {string[]} answers — ответы пользователя в том же порядке
+ * @returns {string} — обогащённый текст
+ */
+function enrichRequestText(requestText, questions, answers) {
+  const parts = [requestText.trim()];
+  questions.forEach((q, i) => {
+    const answer = (answers[i] || "").trim();
+    if (answer) {
+      parts.push(`${q.question}: ${answer}`);
+    }
+  });
+  return parts.join(". ");
 }
 
 // ── Регистрация инструментов ──────────────────────────────────────────────────
@@ -269,7 +476,16 @@ function registerTools(server) {
     "Подбирает профиль(и) группы доступа 1С:БИТ.ФИНАНС по описанию задач сотрудника " +
     "(без LLM, по ключевым словам). " +
     "Режим 'single' — один лучший профиль. " +
-    "Режим 'multi' — все подходящие профили (для должностей с несколькими профилями, например кладовщик).",
+    "Режим 'multi' — все подходящие профили (для должностей с несколькими профилями, например кладовщик). " +
+    "\n\nДВУХШАГОВЫЙ ПРОТОКОЛ УТОЧНЕНИЯ:\n" +
+    "ШАГ 1: Вызовите инструмент БЕЗ параметра `answers`. " +
+    "Сервер вернёт { status: 'NEED_CLARIFICATION', questions: [...] } — " +
+    "5 адаптивных вопросов, подобранных под должность/задачи сотрудника. " +
+    "Задайте эти вопросы пользователю последовательно и соберите ответы.\n" +
+    "ШАГ 2: Вызовите инструмент повторно с параметром `answers` — массивом строк " +
+    "(ответы в том же порядке, что и вопросы из шага 1). " +
+    "Сервер обогатит запрос ответами и вернёт подобранные профили.\n" +
+    "ВАЖНО: Никогда не пропускайте шаг 1. Не передавайте answers при первом вызове.",
     {
       request_text: z.string().describe(
         "Описание задач или функций сотрудника. " +
@@ -279,8 +495,13 @@ function registerTools(server) {
         "'single' — вернуть один наилучший профиль (по умолчанию). " +
         "'multi' — вернуть все подходящие профили."
       ),
+      answers: z.array(z.string()).optional().describe(
+        "Ответы пользователя на 5 уточняющих вопросов из предыдущего вызова (шаг 2). " +
+        "Должны идти в том же порядке, что и вопросы в поле `questions` ответа NEED_CLARIFICATION. " +
+        "Если параметр не передан — сервер вернёт вопросы (шаг 1)."
+      ),
     },
-    async ({ request_text, mode }) => {
+    async ({ request_text, mode, answers }) => {
       const approvalNote = (p) =>
         p.requires_chief_accountant && p.requires_transport_head
           ? "Требуется согласование: руководитель + главный бухгалтер + руководитель АТ"
@@ -290,9 +511,46 @@ function registerTools(server) {
           ? "Требуется согласование: руководитель + руководитель АТ"
           : "Стандартное согласование: только линейный руководитель";
 
+      // ── ШАГ 1: answers не переданы — вернуть уточняющие вопросы ───────────
+      if (!answers) {
+        const questions = buildAdaptiveQuestions(request_text);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "NEED_CLARIFICATION",
+                  message:
+                    "Для точного подбора профиля доступа задайте пользователю следующие 5 уточняющих вопросов. " +
+                    "Затем повторно вызовите suggest_access_profile с параметром answers (массив из 5 ответов).",
+                  request_text,
+                  questions: questions.map((q, i) => ({
+                    index: i + 1,
+                    id: q.id,
+                    category: q.category,
+                    question: q.question,
+                    hint: q.hint,
+                  })),
+                  next_step:
+                    "После получения ответов вызовите suggest_access_profile(" +
+                    `request_text="${request_text}", mode="${mode}", answers=["ответ1", ..., "ответ5"])`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // ── ШАГ 2: answers переданы — обогатить запрос и подобрать профиль ────
+      const questions = buildAdaptiveQuestions(request_text);
+      const enrichedText = enrichRequestText(request_text, questions, answers);
+
       // ── Режим multi ────────────────────────────────────────────────────────
       if (mode === "multi") {
-        const all = suggestProfiles(request_text);
+        const all = suggestProfiles(enrichedText);
 
         if (all.length === 0) {
           return {
@@ -301,8 +559,10 @@ function registerTools(server) {
                 type: "text",
                 text: JSON.stringify(
                   {
+                    status: "NO_MATCH",
                     result: null,
                     message: "Не удалось подобрать профили. Уточните описание задач.",
+                    enriched_request: enrichedText,
                     available_profiles: ACCESS_PROFILES.map((p) => ({
                       id: p.id,
                       name: p.name,
@@ -326,7 +586,9 @@ function registerTools(server) {
               type: "text",
               text: JSON.stringify(
                 {
+                  status: "OK",
                   mode: "multi",
+                  enriched_request: enrichedText,
                   total_profiles: all.length,
                   recommended_profiles: all.map((r) => ({
                     id: r.profile.id,
@@ -360,7 +622,7 @@ function registerTools(server) {
       }
 
       // ── Режим single ───────────────────────────────────────────────────────
-      const { profile, score, explanation } = suggestProfile(request_text);
+      const { profile, score, explanation } = suggestProfile(enrichedText);
 
       if (!profile || score === 0) {
         return {
@@ -369,8 +631,10 @@ function registerTools(server) {
               type: "text",
               text: JSON.stringify(
                 {
+                  status: "NO_MATCH",
                   result: null,
                   message: "Не удалось подобрать профиль. Уточните описание задач.",
+                  enriched_request: enrichedText,
                   available_profiles: ACCESS_PROFILES.map((p) => ({
                     id: p.id,
                     name: p.name,
@@ -391,7 +655,9 @@ function registerTools(server) {
             type: "text",
             text: JSON.stringify(
               {
+                status: "OK",
                 mode: "single",
+                enriched_request: enrichedText,
                 recommended_profile: {
                   id: profile.id,
                   name: profile.name,
@@ -1163,23 +1429,53 @@ app.all("/mcp", async (req, res) => {
 
 // ── Запуск ────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`✅ gti-1c-mcp запущен на порту ${PORT}`);
-  console.log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
-  console.log(`   Health-check : http://localhost:${PORT}/health`);
-  console.log(`   Профилей     : ${ACCESS_PROFILES.length}`);
-  console.log(`   Инструкций   : ${listInstructions().length}`);
-  console.log(`   API Token    : ${API_TOKEN}`);
-
-  // Строим TF-IDF индекс при старте (не блокирует запуск)
+/**
+ * Строим TF-IDF индекс (общая инициализация для обоих режимов)
+ */
+function initTfidf() {
   try {
-    // knowledge_base.js уже загрузила документы при import — берём их через listInstructions
-    // но нам нужен полный контент с tokens, поэтому вызываем loadKnowledgeBase ещё раз
     const allDocs = loadKnowledgeBase();
     buildTfidfIndex(allDocs);
     const stats = getIndexStats();
-    console.log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
+    return stats;
   } catch (err) {
     console.warn(`⚠️  TF-IDF индекс не построен: ${err.message}`);
+    return null;
   }
-});
+}
+
+// ── Режим stdio (для OpenCode / MCP-клиентов типа "local") ───────────────────
+// Если stdin не является TTY — значит нас запустил MCP-клиент через stdio.
+// В этом режиме HTTP-сервер не запускается; весь обмен идёт через stdin/stdout.
+
+if (!process.stdin.isTTY) {
+  const server = new McpServer({
+    name: "gti-1c-mcp",
+    version: "1.0.0",
+  });
+  registerTools(server);
+
+  const transport = new StdioServerTransport();
+  server.connect(transport).then(() => {
+    // TF-IDF строим после подключения
+    const stats = initTfidf();
+    // В stdio-режиме логи идут в stderr (stdout занят протоколом)
+    process.stderr.write(`[gti-1c-mcp] stdio-режим запущен. Профилей: ${ACCESS_PROFILES.length}, инструкций: ${listInstructions().length}${stats ? `, TF-IDF: ${stats.docs_count} doc` : ""}\n`);
+  }).catch((err) => {
+    process.stderr.write(`[gti-1c-mcp] Ошибка запуска stdio: ${err.message}\n`);
+    process.exit(1);
+  });
+
+} else {
+  // ── Режим HTTP (для ручного запуска, Docker, remote-подключений) ────────────
+  app.listen(PORT, () => {
+    console.log(`✅ gti-1c-mcp запущен на порту ${PORT}`);
+    console.log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
+    console.log(`   Health-check : http://localhost:${PORT}/health`);
+    console.log(`   Профилей     : ${ACCESS_PROFILES.length}`);
+    console.log(`   Инструкций   : ${listInstructions().length}`);
+    console.log(`   API Token    : ${API_TOKEN}`);
+    const stats = initTfidf();
+    if (stats) console.log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
+  });
+}

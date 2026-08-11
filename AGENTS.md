@@ -137,7 +137,7 @@ URL: `http://localhost:3031/mcp`
 
 | Инструмент | Когда использовать |
 |---|---|
-| `suggest_access_profile` | Подобрать профиль по описанию задач. Параметр: `request_text` — что делает сотрудник. Режим: `single` или `multi` |
+| `suggest_access_profile` | Подобрать профиль по описанию задач. **Двухшаговый протокол** (см. ниже). Параметры: `request_text`, `mode` (`single`/`multi`), `answers` (опционально — массив из 5 ответов) |
 | `get_roles_matrix` | Получить матрицу ролей. Параметры-фильтры: `filter_requires_accounting`, `filter_requires_transport`, `search_keyword` |
 | `validate_roles` | Проверить набор ролей. Параметр: `roles` — массив строк |
 | `get_approval_level` | Узнать уровень согласования. Параметр: `roles` — массив ролей |
@@ -162,10 +162,61 @@ URL: `http://localhost:3031/mcp`
 
 Агент делает:
 1. suggest_profile_by_job(job_title="кладовщик") → типовые профили из реальных данных
-2. suggest_access_profile(request_text="кладовщик — приходные ордера, расходные ордера, заявки на МПЗ") → профили из RBAC
-3. explain_profile(profile_id="...") → что увидит сотрудник в 1С
-4. get_approval_level(roles=[...]) → кто должен подписать заявку
+2. suggest_access_profile(request_text="кладовщик") → сервер возвращает
+   { status: "NEED_CLARIFICATION", questions: [ {index:1, question:"..."}, ... ] }
+3. Агент задаёт 5 вопросов пользователю, собирает ответы
+4. suggest_access_profile(request_text="кладовщик", answers=["склад №2", "приём ТМЦ", ...])
+   → { status: "OK", recommended_profile: {...} }
+5. explain_profile(profile_id="...") → что увидит сотрудник в 1С
+6. get_approval_level(roles=[...]) → кто должен подписать заявку
 ```
+
+### Двухшаговый протокол suggest_access_profile
+
+**ШАГ 1 — получить вопросы** (вызов без `answers`):
+```json
+suggest_access_profile({
+  "request_text": "механик АТО",
+  "mode": "multi"
+})
+```
+Ответ:
+```json
+{
+  "status": "NEED_CLARIFICATION",
+  "questions": [
+    { "index": 1, "id": "q_job_title",    "question": "Какова точная должность сотрудника?" },
+    { "index": 2, "id": "q_department",   "question": "В каком отделе работает сотрудник?" },
+    { "index": 3, "id": "q_waybills",     "question": "Будет оформлять путевые листы?" },
+    { "index": 4, "id": "q_fuel",         "question": "Нужен доступ к учёту ГСМ?" },
+    { "index": 5, "id": "q_transport_repair", "question": "Будет работать с ремонтом техники?" }
+  ]
+}
+```
+
+**ШАГ 2 — передать ответы** (вызов с `answers`):
+```json
+suggest_access_profile({
+  "request_text": "механик АТО",
+  "mode": "multi",
+  "answers": ["Механик", "АТО (отдел транспорта)", "Нет", "Да, ГСМ и заправки", "Да, ТО и ремонт"]
+})
+```
+Ответ:
+```json
+{
+  "status": "OK",
+  "enriched_request": "механик АТО. Какова точная должность...: Механик. ...",
+  "recommended_profiles": [...]
+}
+```
+
+**Адаптивный выбор вопросов:** сервер анализирует `request_text` и выбирает 5 наиболее релевантных вопросов из пула ~15. Всегда включаются 2 базовых вопроса (должность, отдел) + 3 тематических по контексту:
+- **finance** — если упомянуты деньги, казначейство, платежи
+- **transport** — если упомянуты транспорт, путевые листы, ГСМ, механик
+- **warehouse** — если упомянуты склад, МПЗ, кладовщик
+- **accounting** — если упомянуты бухгалтерия, проводки, налоги
+- **procurement** — если упомянуты договоры, закупки, поставщики
 
 ### Сценарий 2: Найти инструкцию
 
