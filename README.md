@@ -10,6 +10,15 @@ MCP-сервер (Model Context Protocol) для **1С:БИТ / БИТ.СТРО�
 
 ---
 
+## Репозитории
+
+| Платформа | URL |
+|---|---|
+| GitHub | https://github.com/RomanSaranindev/gti-1c-mcp |
+| GitLab | https://gitlab.ide-spb.com/saraninrg/gti-1c-mcp |
+
+---
+
 ## Инструменты (7)
 
 ### База знаний
@@ -31,38 +40,126 @@ MCP-сервер (Model Context Protocol) для **1С:БИТ / БИТ.СТРО�
 
 ---
 
-## Быстрый старт
+## Установка на новом рабочем месте
+
+### Требования
+
+- Node.js 18+ ([скачать](https://nodejs.org/))
+- Git
+- (опционально) Docker + Docker Compose
+
+---
+
+### Вариант 1 — локальный запуск (Node.js)
+
+#### Шаг 1. Клонировать репозиторий
 
 ```bash
-# 1. Установить зависимости
+# С GitHub:
+git clone https://github.com/RomanSaranindev/gti-1c-mcp.git
+
+# Или с GitLab (внутренний):
+git clone https://gitlab.ide-spb.com/saraninrg/gti-1c-mcp.git
+
+cd gti-1c-mcp
+```
+
+#### Шаг 2. Установить зависимости
+
+```bash
 npm install
+```
 
-# 2. Запустить (порт 3031)
+#### Шаг 3. Настроить окружение
+
+```bash
+# Скопировать шаблон
+cp .env.example .env
+```
+
+Открыть `.env` и задать токен:
+
+```env
+MCP_PORT=3031
+MCP_API_TOKEN=ВАШ_СЕКРЕТНЫЙ_ТОКЕН
+```
+
+> Токен по умолчанию `gti-mcp-token-2024` — обязательно смените перед деплоем.
+
+#### Шаг 4. Запустить сервер
+
+```bash
 npm start
+```
 
-# Проверить
+Проверить:
+
+```bash
 curl http://localhost:3031/health
 ```
 
-### Переменные окружения
+---
 
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `MCP_PORT` | `3031` | Порт HTTP-сервера |
-| `MCP_API_TOKEN` | `gti-mcp-token-2024` | Токен авторизации (**смените!**) |
-| `KNOWLEDGE_DIR` | `knowledge/instructions` | Путь к папке с .md-инструкциями |
-
-### Docker
+### Вариант 2 — Docker
 
 ```bash
+git clone https://github.com/RomanSaranindev/gti-1c-mcp.git
+cd gti-1c-mcp
+
+cp .env.example .env
+# Отредактировать .env — задать MCP_API_TOKEN
+
 docker-compose up -d
+```
+
+Проверить:
+
+```bash
+curl http://localhost:3031/health
+```
+
+---
+
+### Вариант 3 — автозапуск на Windows (Task Scheduler)
+
+Чтобы сервер стартовал при загрузке Windows без ручного запуска:
+
+1. Открыть **Планировщик заданий** (`taskschd.msc`)
+2. Действие → Создать задачу
+3. Вкладка **Общие**: имя `gti-1c-mcp`, выполнять для всех пользователей
+4. Вкладка **Триггеры**: При запуске системы
+5. Вкладка **Действия** → Создать:
+   - Программа: `node`
+   - Аргументы: `src/server.js`
+   - Рабочая папка: полный путь к папке проекта (например `C:\projects\gti-1c-mcp`)
+6. Вкладка **Условия**: снять галку "Только при питании от сети"
+7. ОК → ввести пароль пользователя Windows
+
+Или через PowerShell (запустить от администратора):
+
+```powershell
+$action = New-ScheduledTaskAction `
+    -Execute "node" `
+    -Argument "src/server.js" `
+    -WorkingDirectory "C:\projects\gti-1c-mcp"
+
+$trigger = New-ScheduledTaskTrigger -AtStartup
+
+Register-ScheduledTask `
+    -TaskName "gti-1c-mcp" `
+    -Action $action `
+    -Trigger $trigger `
+    -RunLevel Highest `
+    -Force
 ```
 
 ---
 
 ## Подключение к MCP-клиенту
 
-### Kilo Code / OpenCode
+### OpenCode / Kilo Code
+
+Добавить в `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -70,25 +167,67 @@ docker-compose up -d
     "gti-1c": {
       "type": "remote",
       "url": "http://localhost:3031/mcp",
-      "headers": { "X-MCP-Token": "<ВАШ_ТОКЕН>" },
+      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" },
       "enabled": true
     }
   }
 }
 ```
 
+После сохранения — перезапустить opencode.
+
+---
+
 ### Claude Desktop
+
+В файл конфигурации Claude Desktop:
 
 ```json
 {
   "mcpServers": {
     "gti-1c": {
       "url": "http://localhost:3031/mcp",
-      "headers": { "X-MCP-Token": "<ВАШ_ТОКЕН>" }
+      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" }
     }
   }
 }
 ```
+
+---
+
+### Если сервер на другой машине в сети
+
+Замените `localhost` на IP или hostname сервера:
+
+```json
+{
+  "mcp": {
+    "gti-1c": {
+      "type": "remote",
+      "url": "http://192.168.1.100:3031/mcp",
+      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" },
+      "enabled": true
+    }
+  }
+}
+```
+
+Убедитесь, что порт `3031` открыт в брандмауэре сервера:
+
+```powershell
+# На сервере (PowerShell, от администратора):
+New-NetFirewallRule -DisplayName "gti-1c-mcp" -Direction Inbound -Protocol TCP -LocalPort 3031 -Action Allow
+```
+
+---
+
+## Переменные окружения
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `MCP_PORT` | `3031` | Порт HTTP-сервера |
+| `MCP_API_TOKEN` | `gti-mcp-token-2024` | Токен авторизации (**смените!**) |
+| `KNOWLEDGE_DIR` | `knowledge/instructions` | Путь к папке с .md-инструкциями |
 
 ---
 
@@ -114,3 +253,4 @@ gti-1c-mcp/
 
 - Смените `MCP_API_TOKEN` перед публичным деплоем.
 - Эндпоинты `/health` и `/` доступны без токена, все остальные — нет.
+- Не публикуйте `.env` файл в репозиторий (он добавлен в `.gitignore`).
