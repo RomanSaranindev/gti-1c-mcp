@@ -1,0 +1,42 @@
+version: "3.9"
+
+# ================================================================
+# gti-1c-mcp — Docker Compose
+# Запуск: docker-compose up -d
+# ================================================================
+
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gti_1c_mcp
+    restart: unless-stopped
+
+    ports:
+      - "3031:3031"
+
+    environment:
+      MCP_PORT: "3031"
+      # Обязательно смените перед публичным деплоем!
+      MCP_API_TOKEN: "${MCP_API_TOKEN:-gti-mcp-token-2024}"
+
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "fetch('http://localhost:3031/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
