@@ -65,6 +65,16 @@ import {
   getIndexStats,
 } from "./vector_search.js";
 
+import {
+  isOnecConfigured,
+  getOnecConfig,
+  onecRpc,
+  callOnecTool,
+  checkOnecHealth,
+  listOnecTools,
+  formatOnecError,
+} from "./onec_client.js";
+
 // ── Конфигурация ──────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT || process.env.MCP_PORT || "3031");
@@ -1147,6 +1157,362 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТЫ 12–16: Живая база 1С (через HTTP-сервис расширения)
+  // Требуют ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD в .env
+  // и установленного расширения build/MCP_Сервер.cfe
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── 12: onec_health ────────────────────────────────────────────────────────
+
+  server.tool(
+    "onec_health",
+    "Проверяет доступность HTTP-сервиса рабочей базы 1С. " +
+    "Показывает статус подключения, конфигурацию и список инструментов, " +
+    "которые расширение предоставляет агенту. " +
+    "Вызывайте первым при любой работе с живой базой 1С.",
+    {},
+    async () => {
+      const config = getOnecConfig();
+
+      if (!config.configured) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              connected: false,
+              reason: "Не настроено",
+              hint: "Укажите ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD в .env и перезапустите сервер",
+              setup_steps: [
+                "1. Установите расширение build/MCP_Сервер.cfe в базу 1С",
+                "2. Опубликуйте HTTP-сервис mcp_APIBackend через Apache/IIS",
+                "3. Добавьте в .env: ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD",
+                "4. Перезапустите: npm start",
+              ],
+              config: { url: config.url || "(не задан)", configured: false },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Проверяем /health
+      const health = await checkOnecHealth();
+
+      // Пробуем получить список инструментов
+      let tools = null;
+      let toolsError = null;
+      if (health.ok) {
+        try {
+          const toolsResult = await listOnecTools();
+          tools = toolsResult?.tools || toolsResult;
+        } catch (err) {
+          toolsError = err.message;
+        }
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            connected: health.ok,
+            health_status: health.detail,
+            config: {
+              url: config.url,
+              username: config.username,
+              service_root: config.serviceRoot,
+              timeout_ms: config.timeout,
+            },
+            onec_tools_available: tools
+              ? (Array.isArray(tools) ? tools.map(t => ({ name: t.name, description: t.description })) : tools)
+              : null,
+            onec_tools_error: toolsError || undefined,
+            hint: health.ok
+              ? "Подключение работает. Используйте инструменты onec_* для работы с данными."
+              : "Проверьте URL, логин/пароль и доступность HTTP-сервиса 1С.",
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── 13: list_1c_users ──────────────────────────────────────────────────────
+
+  server.tool(
+    "list_1c_users",
+    "Получает список пользователей из рабочей базы 1С. " +
+    "Возвращает ФИО, логин, должность, подразделение, группы доступа. " +
+    "Требует настроенного подключения к 1С (ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD в .env).",
+    {
+      search: z.string().optional().describe(
+        "Поиск по ФИО или логину (частичное совпадение)"
+      ),
+      department: z.string().optional().describe(
+        "Фильтр по подразделению"
+      ),
+      limit: z.number().int().min(1).max(200).default(50).describe(
+        "Максимум записей в ответе (по умолчанию 50)"
+      ),
+      include_inactive: z.boolean().default(false).describe(
+        "Включать неактивных/уволенных пользователей (по умолчанию false)"
+      ),
+    },
+    async ({ search, department, limit, include_inactive }) => {
+      try {
+        const result = await callOnecTool("get_users", {
+          search: search || "",
+          department: department || "",
+          limit,
+          include_inactive,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Для получения списка пользователей используйте инструмент onec_health для диагностики подключения."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
+  // ── 14: get_1c_access_groups ───────────────────────────────────────────────
+
+  server.tool(
+    "get_1c_access_groups",
+    "Получает группы доступа из рабочей базы 1С и назначенных пользователей. " +
+    "Позволяет узнать реальные роли конкретного сотрудника или все группы в системе. " +
+    "Требует настроенного подключения к 1С.",
+    {
+      user_login: z.string().optional().describe(
+        "Логин пользователя 1С — вернуть его группы доступа"
+      ),
+      group_name: z.string().optional().describe(
+        "Фильтр по названию группы доступа (частичное совпадение)"
+      ),
+      include_roles: z.boolean().default(false).describe(
+        "Включать список ролей каждой группы (может увеличить ответ)"
+      ),
+    },
+    async ({ user_login, group_name, include_roles }) => {
+      try {
+        const result = await callOnecTool("get_access_groups", {
+          user_login: user_login || "",
+          group_name: group_name || "",
+          include_roles,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Используйте onec_health для проверки подключения к 1С."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
+  // ── 15: execute_1c_query ───────────────────────────────────────────────────
+
+  server.tool(
+    "execute_1c_query",
+    "Выполняет произвольный запрос к данным 1С через расширение. " +
+    "Агент может запросить данные из любого справочника, регистра или документа " +
+    "БИТ.ФИНАНС — например, сотрудников, ТМЦ, договоры, путевые листы. " +
+    "ВАЖНО: запросы только на чтение (SELECT), изменение данных не поддерживается. " +
+    "Требует настроенного подключения к 1С.",
+    {
+      query_text: z.string().describe(
+        "Текст запроса на языке запросов 1С (СКД-совместимый синтаксис). " +
+        "Например: 'ВЫБРАТЬ Наименование, ИНН ИЗ Справочник.Контрагенты ГДЕ ИНН ПОДОБНО \"7802%\"'"
+      ),
+      params: z.record(z.unknown()).optional().describe(
+        "Параметры запроса в виде объекта {имяПараметра: значение}"
+      ),
+      limit: z.number().int().min(1).max(1000).default(100).describe(
+        "Максимум строк результата (по умолчанию 100, максимум 1000)"
+      ),
+    },
+    async ({ query_text, params, limit }) => {
+      try {
+        const result = await callOnecTool("execute_query", {
+          query: query_text,
+          params: params || {},
+          limit,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              query: query_text,
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Проверьте синтаксис запроса. Используйте get_1c_metadata чтобы узнать доступные объекты."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
+  // ── 16: get_1c_metadata ────────────────────────────────────────────────────
+
+  server.tool(
+    "get_1c_metadata",
+    "Возвращает метаданные конфигурации 1С: список объектов (справочники, документы, " +
+    "регистры и т.д.) с их реквизитами. Используйте перед execute_1c_query чтобы " +
+    "узнать правильные имена таблиц и полей. Требует настроенного подключения к 1С.",
+    {
+      object_type: z.enum([
+        "catalogs", "documents", "registers_accumulation",
+        "registers_info", "registers_accounting", "all"
+      ]).default("all").describe(
+        "Тип объектов метаданных: catalogs (справочники), documents (документы), " +
+        "registers_accumulation (регистры накопления), registers_info (регистры сведений), " +
+        "registers_accounting (регистры бухгалтерии), all (все)"
+      ),
+      object_name: z.string().optional().describe(
+        "Фильтр по имени объекта (частичное совпадение). " +
+        "Например: 'Контрагент', 'ПутевойЛист', 'ГСМ'"
+      ),
+      include_attributes: z.boolean().default(false).describe(
+        "Включать реквизиты объектов (по умолчанию false — только список объектов)"
+      ),
+    },
+    async ({ object_type, object_name, include_attributes }) => {
+      try {
+        const result = await callOnecTool("get_metadata", {
+          object_type,
+          object_name: object_name || "",
+          include_attributes,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Используйте onec_health для проверки подключения к 1С."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
+  // ── 17: get_1c_documents ───────────────────────────────────────────────────
+
+  server.tool(
+    "get_1c_documents",
+    "Получает документы из рабочей базы 1С:БИТ.ФИНАНС — путевые листы, " +
+    "платёжные поручения, заявки на оплату, расходные ордера на ГСМ и т.д. " +
+    "Поддерживает фильтрацию по типу документа, периоду, статусу, контрагенту. " +
+    "Требует настроенного подключения к 1С.",
+    {
+      document_type: z.string().describe(
+        "Тип документа на языке метаданных 1С. Например: " +
+        "'ПутевойЛист', 'ЗаявкаНаОплату', 'ПоступлениеНаСклад', " +
+        "'РасходнаяНакладная', 'РасходОрдерНаГСМ'. " +
+        "Используйте get_1c_metadata для получения доступных типов."
+      ),
+      date_from: z.string().optional().describe(
+        "Начальная дата периода в формате ГГГГ-ММ-ДД (например '2024-01-01')"
+      ),
+      date_to: z.string().optional().describe(
+        "Конечная дата периода в формате ГГГГ-ММ-ДД (например '2024-12-31')"
+      ),
+      status: z.string().optional().describe(
+        "Фильтр по статусу документа: 'Проведён', 'НеПроведён', 'Помечен'"
+      ),
+      counterparty: z.string().optional().describe(
+        "Фильтр по контрагенту (частичное совпадение по наименованию)"
+      ),
+      limit: z.number().int().min(1).max(500).default(50).describe(
+        "Максимум документов в ответе (по умолчанию 50)"
+      ),
+    },
+    async ({ document_type, date_from, date_to, status, counterparty, limit }) => {
+      try {
+        const result = await callOnecTool("get_documents", {
+          document_type,
+          date_from: date_from || "",
+          date_to: date_to || "",
+          status: status || "",
+          counterparty: counterparty || "",
+          limit,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source: "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              document_type,
+              filters: { date_from, date_to, status, counterparty },
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Используйте get_1c_metadata для уточнения имени типа документа, " +
+              "или onec_health для проверки подключения."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 11: search_by_role
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1319,24 +1685,35 @@ app.post("/reload", async (req, res) => {
 });
 
 // Health-check
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
+  const onecHealth = await checkOnecHealth();
   res.json({
     status: "ok",
     server: "gti-1c-mcp",
-    version: "1.0.0",
+    version: "2.0.0",
     tools: [
+      // База знаний
       "list_instructions",
       "search_instructions",
       "get_instruction",
+      "semantic_search_instructions",
+      // Профили доступа RBAC
       "suggest_access_profile",
       "get_roles_matrix",
       "validate_roles",
       "get_approval_level",
-      "suggest_profile_by_job",
-      "list_jobs",
-      "semantic_search_instructions",
       "explain_profile",
       "search_by_role",
+      // Маппинг должность → профили
+      "suggest_profile_by_job",
+      "list_jobs",
+      // Живая база 1С
+      "onec_health",
+      "list_1c_users",
+      "get_1c_access_groups",
+      "execute_1c_query",
+      "get_1c_metadata",
+      "get_1c_documents",
     ],
     profiles_count: ACCESS_PROFILES.length,
     knowledge_base: {
@@ -1351,18 +1728,38 @@ app.get("/health", (req, res) => {
       total_jobs: Object.keys(JOB_PROFILES_MAP).length,
       source: "Employee database.xlsx (anonymized)",
     },
+    onec_connection: {
+      configured: getOnecConfig().configured,
+      url: getOnecConfig().url || null,
+      status: onecHealth.ok ? "ok" : "unavailable",
+      detail: onecHealth.detail,
+    },
     timestamp: new Date().toISOString(),
   });
 });
 
 // Корень — справка по подключению
 app.get("/", (req, res) => {
+  const onecCfg = getOnecConfig();
   res.json({
-    name: "gti-1c-mcp: Инструкции 1С.БИТ + Профили доступа RBAC",
+    name: "gti-1c-mcp: Инструкции 1С.БИТ + Профили доступа RBAC + Живая база 1С",
+    version: "2.0.0",
     mcp_endpoint: `http://HOST:${PORT}/mcp`,
     health: `http://HOST:${PORT}/health`,
     auth_header: "X-MCP-Token: <token>",
     docs: "Добавьте в клиент MCP: Remote → URL: http://localhost:3031/mcp, Header: X-MCP-Token: <token>",
+    tool_groups: {
+      knowledge_base: ["list_instructions", "search_instructions", "get_instruction", "semantic_search_instructions"],
+      rbac_profiles: ["suggest_access_profile", "get_roles_matrix", "validate_roles", "get_approval_level", "explain_profile", "search_by_role"],
+      job_mapping: ["suggest_profile_by_job", "list_jobs"],
+      live_1c: ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents"],
+    },
+    onec_integration: {
+      configured: onecCfg.configured,
+      url: onecCfg.url || "(не настроено)",
+      setup: onecCfg.configured ? "OK" : "Укажите ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD в .env",
+      extension: "Установите build/MCP_Сервер.cfe в базу 1С (расширение от vladimir-kharin/1c_mcp)",
+    },
   });
 });
 
