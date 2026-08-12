@@ -6,3 +6,9 @@ node_modules/
 Employee database.xlsx
 *.xlsx
 *.xls
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+py_proxy/venv/
