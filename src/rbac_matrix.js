@@ -3413,6 +3413,7 @@ export const ACCESS_PROFILES = [
     "id": "PROFILE_ГТИ_ДОБАВЛЕНИЕ_И_ИЗМЕНЕНИЕ_ДАННЫХ_БУХГАЛТЕРИИ_ПОКУПКА_ПРОДАЖА_СКЛАД",
     "name": "ГТИ. Добавление и изменение данных бухгалтерии. Покупка, Продажа, Склад",
     "description": "ГТИ. Добавление и изменение данных бухгалтерии. Покупка, Продажа, Склад",
+    "notes": "ВНИМАНИЕ: Профиль даёт право СОЗДАВАТЬ и РЕДАКТИРОВАТЬ документы бухгалтерского учёта (покупка, продажа, склад). Не является профилем 'только просмотр'. Обязательно требует согласования Главного бухгалтера перед выдачей. Кладовщикам и складским работникам, которым нужен только просмотр БУ, следует предоставлять профиль 'ГТИ. Чтение данных бухгалтерии. Покупка' вместо данного.",
     "keywords": [
       "кладовщик",
       "склад",
@@ -4567,7 +4568,8 @@ export const ACCESS_PROFILES = [
     ],
     "business_function_ids": [],
     "requires_chief_accountant": false,
-    "requires_transport_head": false
+    "requires_transport_head": false,
+    "requires_procurement_director": true
   },
   {
     "id": "PROFILE_СНАБЖЕНИЕ_И_СКЛАД_ГТИ_ЗАКУПКИ_ЧТЕНИЕ",
@@ -4591,7 +4593,8 @@ export const ACCESS_PROFILES = [
     ],
     "business_function_ids": [],
     "requires_chief_accountant": false,
-    "requires_transport_head": false
+    "requires_transport_head": false,
+    "requires_procurement_director": true
   },
   {
     "id": "PROFILE_СНАБЖЕНИЕ_И_СКЛАД_ГТИ_ЗАЯВКИ_НА_МПЗ_ДОБАВЛЕНИЕ_ИЗМЕНЕНИЕ",

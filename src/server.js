@@ -512,14 +512,15 @@ function registerTools(server) {
       ),
     },
     async ({ request_text, mode, answers }) => {
-      const approvalNote = (p) =>
-        p.requires_chief_accountant && p.requires_transport_head
-          ? "Требуется согласование: руководитель + главный бухгалтер + руководитель АТ"
-          : p.requires_chief_accountant
-          ? "Требуется согласование: руководитель + главный бухгалтер"
-          : p.requires_transport_head
-          ? "Требуется согласование: руководитель + руководитель АТ"
+      const approvalNote = (p) => {
+        const parts = [];
+        if (p.requires_chief_accountant) parts.push("главный бухгалтер");
+        if (p.requires_transport_head) parts.push("руководитель АТ");
+        if (p.requires_procurement_director) parts.push("директор по закупкам");
+        return parts.length > 0
+          ? `Требуется согласование: руководитель + ${parts.join(" + ")}`
           : "Стандартное согласование: только линейный руководитель";
+      };
 
       // ── ШАГ 1: answers не переданы — вернуть уточняющие вопросы ───────────
       if (!answers) {
@@ -589,6 +590,7 @@ function registerTools(server) {
 
         const needsChief = all.some((r) => r.profile.requires_chief_accountant);
         const needsTransport = all.some((r) => r.profile.requires_transport_head);
+        const needsProcurement = all.some((r) => r.profile.requires_procurement_director);
 
         return {
           content: [
@@ -604,23 +606,23 @@ function registerTools(server) {
                     id: r.profile.id,
                     name: r.profile.name,
                     description: r.profile.description,
+                    ...(r.profile.notes ? { notes: r.profile.notes } : {}),
                     key_roles: r.profile.key_roles,
                     requires_chief_accountant: r.profile.requires_chief_accountant,
                     requires_transport_head: r.profile.requires_transport_head,
+                    requires_procurement_director: r.profile.requires_procurement_director || false,
                     match_score: r.score,
                     explanation: r.explanation,
                   })),
                   approval_summary: {
                     requires_chief_accountant: needsChief,
                     requires_transport_head: needsTransport,
-                    approval_note:
-                      needsChief && needsTransport
-                        ? "Требуется согласование: руководитель + главный бухгалтер + руководитель АТ"
-                        : needsChief
-                        ? "Требуется согласование: руководитель + главный бухгалтер"
-                        : needsTransport
-                        ? "Требуется согласование: руководитель + руководитель АТ"
-                        : "Стандартное согласование: только линейный руководитель",
+                    requires_procurement_director: needsProcurement,
+                    approval_note: approvalNote({
+                      requires_chief_accountant: needsChief,
+                      requires_transport_head: needsTransport,
+                      requires_procurement_director: needsProcurement,
+                    }),
                   },
                 },
                 null,
@@ -668,13 +670,15 @@ function registerTools(server) {
                 status: "OK",
                 mode: "single",
                 enriched_request: enrichedText,
-                recommended_profile: {
+                  recommended_profile: {
                   id: profile.id,
                   name: profile.name,
                   description: profile.description,
+                  ...(profile.notes ? { notes: profile.notes } : {}),
                   key_roles: profile.key_roles,
                   requires_chief_accountant: profile.requires_chief_accountant,
                   requires_transport_head: profile.requires_transport_head,
+                  requires_procurement_director: profile.requires_procurement_director || false,
                 },
                 match_score: score,
                 explanation,
@@ -954,6 +958,7 @@ function registerTools(server) {
     async ({ roles }) => {
       let requiresAccounting = false;
       let requiresTransport = false;
+      let requiresProcurement = false;
       const matchedFunctions = [];
 
       for (const func of RBAC_MATRIX.business_functions) {
@@ -964,6 +969,13 @@ function registerTools(server) {
         }
       }
 
+      // Проверить профили по requires_procurement_director
+      for (const profile of ACCESS_PROFILES) {
+        if (profile.requires_procurement_director && profile.key_roles.some((r) => roles.includes(r))) {
+          requiresProcurement = true;
+        }
+      }
+
       const level =
         requiresAccounting && requiresTransport
           ? "transport_accounting"
@@ -971,6 +983,8 @@ function registerTools(server) {
           ? "accounting"
           : requiresTransport
           ? "transport"
+          : requiresProcurement
+          ? "procurement"
           : "standard";
 
       return {
@@ -982,10 +996,12 @@ function registerTools(server) {
                 approval_level: level,
                 requires_chief_accountant: requiresAccounting,
                 requires_transport_head: requiresTransport,
+                requires_procurement_director: requiresProcurement,
                 approvers_required: [
                   "Линейный руководитель (всегда обязателен)",
                   ...(requiresAccounting ? ["Главный бухгалтер (есть роли БУ/НУ)"] : []),
                   ...(requiresTransport ? ["Руководитель отдела АТ (есть транспортные роли)"] : []),
+                  ...(requiresProcurement ? ["Директор по закупкам (есть роли закупок)"] : []),
                 ],
                 matched_business_functions: matchedFunctions,
                 description: {
@@ -993,6 +1009,7 @@ function registerTools(server) {
                   accounting: "Руководитель + Главный бухгалтер",
                   transport: "Руководитель + Руководитель АТ",
                   transport_accounting: "Руководитель + Главный бухгалтер + Руководитель АТ",
+                  procurement: "Руководитель + Директор по закупкам",
                 }[level],
               },
               null,
@@ -1106,6 +1123,7 @@ function registerTools(server) {
       // 6. approval
       const requiresAccounting = profile.requires_chief_accountant;
       const requiresTransport = profile.requires_transport_head;
+      const requiresProcurement = profile.requires_procurement_director || false;
       const approvalLevel =
         requiresAccounting && requiresTransport
           ? "transport_accounting"
@@ -1113,10 +1131,13 @@ function registerTools(server) {
           ? "accounting"
           : requiresTransport
           ? "transport"
+          : requiresProcurement
+          ? "procurement"
           : "standard";
       const approvers = ["Линейный руководитель (всегда)"];
       if (requiresAccounting) approvers.push("Главный бухгалтер");
       if (requiresTransport) approvers.push("Руководитель отдела АТ");
+      if (requiresProcurement) approvers.push("Директор по закупкам");
       const approvalNote =
         approvalLevel === "transport_accounting"
           ? "Требуется согласование руководителя, главного бухгалтера и руководителя АТ"
@@ -1124,6 +1145,8 @@ function registerTools(server) {
           ? "Требуется согласование руководителя и главного бухгалтера"
           : approvalLevel === "transport"
           ? "Требуется согласование руководителя и руководителя АТ"
+          : approvalLevel === "procurement"
+          ? "Требуется согласование руководителя и директора по закупкам"
           : "Стандартное согласование — только линейный руководитель";
 
       return {
@@ -1136,6 +1159,7 @@ function registerTools(server) {
                   id: profile.id,
                   name: profile.name,
                   description: profile.description,
+                  ...(profile.notes ? { notes: profile.notes } : {}),
                 },
                 can_do: canDo,
                 accessible_sections: accessibleSections,
@@ -1556,6 +1580,7 @@ function registerTools(server) {
             matched_role: matched,
             requires_chief_accountant: p.requires_chief_accountant,
             requires_transport_head: p.requires_transport_head,
+            requires_procurement_director: p.requires_procurement_director || false,
           });
         }
       }
