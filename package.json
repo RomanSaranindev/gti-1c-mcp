@@ -1,6 +1,6 @@
 {
   "name": "gti-1c-mcp",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "MCP-сервер: база знаний инструкций 1С.БИТ и подбор профилей доступа RBAC",
   "type": "module",
   "main": "src/server.js",

@@ -5383,6 +5383,48 @@ export const ACCESS_PROFILES = [
 ];
 
 /**
+ * Автоматически заполняет business_function_ids для всех профилей ACCESS_PROFILES
+ * на основе пересечения key_roles профиля с roles каждой бизнес-функции из RBAC_MATRIX.
+ *
+ * Нормализация: в ACCESS_PROFILES роли хранятся с префиксом "Роль.",
+ * в RBAC_MATRIX — без него. Сравниваем без префикса.
+ *
+ * Вызывается один раз при инициализации модуля (IIFE в конце блока данных).
+ */
+function initBusinessFunctionIds() {
+  for (const profile of ACCESS_PROFILES) {
+    // Нормализуем роли профиля: убираем префикс "Роль." если есть
+    const profileRolesNorm = new Set(
+      profile.key_roles.map((r) => r.replace(/^Роль\./, ""))
+    );
+
+    profile.business_function_ids = RBAC_MATRIX.business_functions
+      .filter((bf) => bf.roles.some((r) => profileRolesNorm.has(r)))
+      .map((bf) => bf.id);
+  }
+}
+
+// Инициализируем при загрузке модуля
+initBusinessFunctionIds();
+
+/**
+ * Возвращает все профили, покрывающие указанную бизнес-функцию.
+ *
+ * @param {string} functionId - id бизнес-функции из RBAC_MATRIX (например "TRANSPORT_DISPATCHER")
+ * @returns {{ profile: object, business_function: object } | null}
+ */
+export function getProfilesByFunction(functionId) {
+  const bf = RBAC_MATRIX.business_functions.find((f) => f.id === functionId);
+  if (!bf) return null;
+
+  const profiles = ACCESS_PROFILES.filter((p) =>
+    p.business_function_ids.includes(functionId)
+  );
+
+  return { business_function: bf, profiles };
+}
+
+/**
  * Подбирает ВСЕ подходящие профили доступа по тексту запроса и/или набору ролей.
  * Возвращает массив, отсортированный по score DESC. Профили с score=0 исключаются.
  *

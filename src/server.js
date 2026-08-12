@@ -4,27 +4,36 @@
  * Транспорт: Streamable HTTP (stateful, SDK 1.12+)
  * Порт: 3031 (по умолчанию)
  *
- * Инструменты (12):
+ * Инструменты (19):
  *
  * База знаний инструкций 1С.БИТ:
- *   1. list_instructions           — список всех инструкций (с фильтрами по коду/ключевому слову)
- *   2. search_instructions         — полнотекстовый поиск по базе знаний
- *   3. get_instruction             — полный текст инструкции по id или коду (ИП-301 и т.д.)
- *   4. semantic_search_instructions — TF-IDF + cosine similarity поиск (семантический)
+ *   1. list_instructions              — список всех инструкций (с фильтрами по коду/ключевому слову)
+ *   2. search_instructions            — полнотекстовый поиск по базе знаний
+ *   3. get_instruction                — полный текст инструкции по id или коду (ИП-301 и т.д.)
+ *   4. semantic_search_instructions   — TF-IDF + cosine similarity поиск (семантический)
+ *   5. list_instructions_by_topic     — инструкции по тематическому разделу
  *
  * Профили доступа и матрица ролей RBAC:
- *   4. suggest_access_profile  — keyword-подбор профиля группы доступа (без LLM)
- *   5. get_roles_matrix        — полная матрица ролей RBAC
- *   6. validate_roles          — проверка корректности набора ролей
- *   7. get_approval_level      — уровень согласования по набору ролей
+ *   6. suggest_access_profile         — keyword-подбор профиля группы доступа (без LLM)
+ *   7. get_roles_matrix               — полная матрица ролей RBAC
+ *   8. validate_roles                 — проверка корректности набора ролей
+ *   9. get_approval_level             — уровень согласования по набору ролей
+ *  10. get_profiles_by_function       — профили доступа по бизнес-функции RBAC
  *
  * Маппинг должность → профили (обезличенные данные сотрудников):
- *   8. suggest_profile_by_job  — типовые профили по названию должности (417 должностей)
- *   9. list_jobs               — список должностей из базы данных
+ *  11. suggest_profile_by_job         — типовые профили по названию должности (417 должностей)
+ *  12. list_jobs                      — список должностей из базы данных
  *
  * Объяснение и поиск по ролям:
- *  10. explain_profile        — объяснение профиля на языке бизнеса
- *  11. search_by_role         — поиск профилей и бизнес-функций по роли 1С
+ *  13. explain_profile                — объяснение профиля на языке бизнеса
+ *  14. search_by_role                 — поиск профилей и бизнес-функций по роли 1С
+ *
+ * Живая база 1С (требует расширение + ONEC_* в .env):
+ *  15. onec_health                    — статус подключения к 1С
+ *  16. list_1c_users                  — список пользователей базы
+ *  17. get_1c_access_groups           — группы доступа пользователя
+ *  18. execute_1c_query               — произвольный запрос к данным 1С
+ *  19. get_1c_metadata                — метаданные конфигурации 1С
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -43,6 +52,7 @@ import {
   ACCESS_PROFILES,
   suggestProfile,
   suggestProfiles,
+  getProfilesByFunction,
 } from "./rbac_matrix.js";
 
 import {
@@ -50,6 +60,7 @@ import {
   findJobs,
   getJobProfiles,
   suggestByJobQuery,
+  checkJobAnomaly,
 } from "./job_profiles.js";
 
 import {
@@ -57,6 +68,8 @@ import {
   listInstructions,
   searchInstructions,
   getInstruction,
+  listTopics,
+  getInstructionsByTopic,
 } from "./knowledge_base.js";
 
 import {
@@ -64,6 +77,12 @@ import {
   tfidfSearch,
   getIndexStats,
 } from "./vector_search.js";
+
+import {
+  buildEmbeddingIndex,
+  embeddingSearch,
+  getEmbeddingStats,
+} from "./embedding_search.js";
 
 import {
   isOnecConfigured,
@@ -339,6 +358,78 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 5: list_instructions_by_topic
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "list_instructions_by_topic",
+    "Возвращает все инструкции 1С.БИТ из указанного тематического раздела. " +
+    "Доступные разделы: Казначейство, Транспорт и ГСМ, Склад и снабжение, Бюджетирование, " +
+    "Бухгалтерия, Закупки и договоры, Номенклатура и НСИ, ЭДО, Методические, Доступ и роли. " +
+    "Без параметра topic возвращает все доступные разделы с количеством инструкций.",
+    {
+      topic: z.string().optional().describe(
+        "Название тематического раздела (частичное совпадение). " +
+        "Например: 'Казначейство', 'Транспорт', 'Склад'. " +
+        "Если не указан — возвращает список всех разделов."
+      ),
+    },
+    async ({ topic }) => {
+      if (!topic) {
+        // Вернуть список разделов с количеством инструкций
+        const topics = listTopics();
+        const topicStats = topics.map((t) => {
+          const count = getInstructionsByTopic(t).length;
+          return { topic: t, instructions_count: count };
+        });
+        // Добавляем инструкции без раздела
+        const all = listInstructions();
+        const withoutTopic = all.filter((d) => !d.topic);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  available_topics: topicStats,
+                  without_topic_count: withoutTopic.length,
+                  hint: "Укажите topic для получения инструкций по разделу. " +
+                    "Например: list_instructions_by_topic(topic='Казначейство')",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const results = getInstructionsByTopic(topic);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                topic_query: topic,
+                found: results.length,
+                instructions: results,
+                hint: results.length === 0
+                  ? "Инструкции не найдены. Проверьте название раздела через list_instructions_by_topic() без параметров."
+                  : `Найдено ${results.length} инструкций. Используйте get_instruction(id) для получения полного текста.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 2: search_instructions
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -431,14 +522,16 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 4: semantic_search_instructions (TF-IDF + cosine)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 4: semantic_search_instructions (Embedding → TF-IDF fallback)
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.tool(
     "semantic_search_instructions",
-    "Семантический поиск по инструкциям 1С.БИТ на основе TF-IDF + косинусного сходства. " +
-    "Понимает смысловые запросы лучше, чем keyword-поиск: находит документы по близким понятиям. " +
-    "Например: 'как оформить расход топлива' найдёт инструкции по заправке и ведомостям ГСМ.",
+    "Семантический поиск по инструкциям 1С.БИТ. " +
+    "Если модель multilingual-e5-small загружена — использует нейронные эмбеддинги (понимает синонимы и смысл). " +
+    "Если модель недоступна — автоматически переходит на TF-IDF + косинусное сходство. " +
+    "Например: 'как оформить расход топлива' найдёт инструкции по ГСМ даже если слово 'топливо' там не написано.",
     {
       query: z.string().describe(
         "Поисковый запрос на естественном языке. Например: " +
@@ -448,28 +541,53 @@ function registerTools(server) {
         "Максимум результатов (по умолчанию 5)"
       ),
       min_score: z.number().min(0).max(1).default(0.01).describe(
-        "Минимальный порог релевантности (0.0–1.0, по умолчанию 0.01)"
+        "Минимальный порог релевантности (0.0–1.0, по умолчанию 0.01). " +
+        "Для embedding-режима рекомендуется 0.3+"
       ),
     },
     async ({ query, limit, min_score }) => {
+      // 1. Пробуем нейронные эмбеддинги
+      const embStats = getEmbeddingStats();
+      if (embStats.is_ready) {
+        const embResult = await embeddingSearch(query, { limit, minScore: min_score });
+        if (embResult) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                ...embResult,
+                search_mode: "embedding",
+                model: embStats.model,
+              }, null, 2),
+            }],
+          };
+        }
+      }
+
+      // 2. Fallback на TF-IDF
       const stats = getIndexStats();
       if (!stats.ready) {
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              error: "TF-IDF индекс не готов. Попробуйте через несколько секунд после старта сервера.",
+              error: "Ни embedding-индекс, ни TF-IDF индекс не готовы. " +
+                "Попробуйте через несколько секунд после старта сервера.",
               fallback: "Используйте search_instructions для keyword-поиска.",
+              embedding_status: embStats,
             }, null, 2),
           }],
         };
       }
+
       const result = tfidfSearch(query, { limit, minScore: min_score });
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
             ...result,
+            search_mode: "tfidf_fallback",
+            embedding_status: embStats,
             index_stats: stats,
           }, null, 2),
         }],
@@ -853,6 +971,9 @@ function registerTools(server) {
         };
       }
 
+      // Проверяем аномалию данных для найденной должности
+      const anomaly = checkJobAnomaly(matchedJob, exactData);
+
       // Фильтрация по min_pct
       const filtered = exactData.typical_profiles
         .filter((p) => p.pct >= min_pct)
@@ -870,6 +991,20 @@ function registerTools(server) {
                 total_persons_in_db: exactData.total_persons,
                 min_pct_filter: min_pct,
                 profiles_count: filtered.length,
+                data_quality: anomaly.is_anomaly
+                  ? {
+                      is_anomaly: true,
+                      reason: anomaly.reason,
+                      warning:
+                        anomaly.reason === "all_profiles_100pct"
+                          ? "Данные нерепрезентативны: все профили имеют 100% охват — " +
+                            "вероятно, в выборке присутствуют тестовые учётные записи с полным набором прав. " +
+                            "Рекомендации могут не отражать реальный набор прав для этой должности."
+                          : anomaly.reason === "insufficient_sample"
+                          ? `Малая выборка: только ${exactData.total_persons} чел. Статистика может быть недостоверной.`
+                          : "Нерепрезентативные данные.",
+                    }
+                  : { is_anomaly: false },
                 typical_profiles: filtered.map((p) => ({
                   profile: p.profile,
                   coverage_pct: p.pct,
@@ -911,11 +1046,19 @@ function registerTools(server) {
       ),
     },
     async ({ filter, limit }) => {
-      let jobs = Object.entries(JOB_PROFILES_MAP).map(([job, data]) => ({
-        job_title: job,
-        total_persons: data.total_persons,
-        typical_profiles_count: data.typical_profiles.filter((p) => p.pct >= 40).length,
-      }));
+      let jobs = Object.entries(JOB_PROFILES_MAP)
+        // Фильтруем технический мусор
+        .filter(([job]) => !job.includes("<Объект не найден>"))
+        .map(([job, data]) => {
+          const anomaly = checkJobAnomaly(job, data);
+          return {
+            job_title: job,
+            total_persons: data.total_persons,
+            typical_profiles_count: data.typical_profiles.filter((p) => p.pct >= 40).length,
+            is_anomaly: anomaly.is_anomaly,
+            anomaly_reason: anomaly.reason,
+          };
+        });
 
       if (filter) {
         const q = filter.toLowerCase();
@@ -925,6 +1068,8 @@ function registerTools(server) {
       // Сортируем по числу сотрудников (самые частые — вверх)
       jobs.sort((a, b) => b.total_persons - a.total_persons);
 
+      const anomalyCount = jobs.filter((j) => j.is_anomaly).length;
+
       return {
         content: [
           {
@@ -932,7 +1077,12 @@ function registerTools(server) {
             text: JSON.stringify(
               {
                 total_found: jobs.length,
+                anomaly_count: anomalyCount,
                 filter: filter || null,
+                note: anomalyCount > 0
+                  ? `${anomalyCount} должностей помечены как нерепрезентативные (is_anomaly=true). ` +
+                    "Причины: insufficient_sample (<3 чел.), all_profiles_100pct (тестовые данные)."
+                  : undefined,
                 jobs: jobs.slice(0, limit),
               },
               null,
@@ -1537,6 +1687,7 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 11: search_by_role
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1627,6 +1778,87 @@ function registerTools(server) {
       };
     }
   );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 12: get_profiles_by_function
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "get_profiles_by_function",
+    "Возвращает все профили доступа 1С, покрывающие указанную бизнес-функцию. " +
+    "Например: какие профили нужны для работы с казначейством? " +
+    "Используйте get_roles_matrix чтобы узнать доступные id бизнес-функций.",
+    {
+      function_id: z.string().describe(
+        "ID бизнес-функции из RBAC_MATRIX. Например: 'TRANSPORT_DISPATCHER', " +
+        "'FINANCE_TREASURY_EXECUTOR', 'WAREHOUSE_OPERATOR'. " +
+        "Получить список функций: get_roles_matrix."
+      ),
+    },
+    async ({ function_id }) => {
+      const result = getProfilesByFunction(function_id);
+
+      if (!result) {
+        // Попробуем подсказать похожие функции
+        const available = RBAC_MATRIX.business_functions.map((f) => ({
+          id: f.id,
+          display_name: f.display_name,
+        }));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `Бизнес-функция '${function_id}' не найдена в матрице RBAC.`,
+                  available_functions: available,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const { business_function: bf, profiles } = result;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                business_function: {
+                  id: bf.id,
+                  display_name: bf.display_name,
+                  description: bf.description,
+                  requires_chief_accountant: bf.requires_chief_accountant,
+                  requires_transport_head: bf.requires_transport_head,
+                  roles_count: bf.roles.length,
+                },
+                profiles_count: profiles.length,
+                profiles: profiles.map((p) => ({
+                  id: p.id,
+                  name: p.name,
+                  description: p.description,
+                  requires_chief_accountant: p.requires_chief_accountant,
+                  requires_transport_head: p.requires_transport_head,
+                  covered_business_functions: p.business_function_ids,
+                })),
+                hint: profiles.length === 0
+                  ? "Ни один профиль не покрывает эту бизнес-функцию напрямую. " +
+                    "Используйте search_by_role для поиска по конкретной роли."
+                  : `Найдено ${profiles.length} профилей. Для подробностей используйте explain_profile.`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
 }
 
 // ── HTTP-сервер ───────────────────────────────────────────────────────────────
@@ -1667,6 +1899,14 @@ async function reloadKnowledgeBase(reason = "manual") {
     const elapsed = Date.now() - start;
     const idxStats = getIndexStats();
     console.log(`✅ База знаний перезагружена (${reason}): ${docs.length} инструкций, vocab=${idxStats.vocab_size} за ${elapsed}ms`);
+
+    // Обновляем embedding-индекс в фоне (не блокируем перезагрузку)
+    buildEmbeddingIndex(docs).then((embResult) => {
+      if (embResult.is_ready) {
+        console.log(`🧠 Embedding-индекс обновлён: ${embResult.docs_count} документов`);
+      }
+    }).catch(() => {}); // Ошибки уже логируются внутри buildEmbeddingIndex
+
     return { success: true, docs_count: docs.length, elapsed_ms: elapsed, reloaded_at: lastReloadAt, index: idxStats };
   } catch (err) {
     console.error("❌ Ошибка перезагрузки базы знаний:", err.message);
@@ -1748,6 +1988,7 @@ app.get("/health", async (req, res) => {
       last_reload: lastReloadAt,
     },
     tfidf_index: getIndexStats(),
+    embedding_index: getEmbeddingStats(),
     job_profiles: {
       loaded: true,
       total_jobs: Object.keys(JOB_PROFILES_MAP).length,

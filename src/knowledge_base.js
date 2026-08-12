@@ -16,31 +16,64 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { STOPWORDS } from "./stopwords.js";
+import { stemTokenize, stem } from "./stemmer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_DIR = process.env.KNOWLEDGE_DIR || path.join(__dirname, "..", "knowledge", "instructions");
 
 let INSTRUCTION_DOCS = [];
 
-const STOPWORDS = new Set([
-  "и", "в", "во", "на", "не", "что", "с", "со", "как", "по", "для", "из", "от", "за",
-  "при", "или", "это", "то", "же", "бы", "а", "но", "к", "о", "об", "если", "до",
-  "the", "a", "an", "of", "and", "or", "to", "in", "for", "with", "on", "at", "is",
-  "1с", "бит", "1с.бит", "пользователя", "инструкция", "документ", "порядок", "формирование",
-  "например", "также", "данные", "значения", "значение", "поля", "поле", "рисунок"
-]);
-
 function normalize(text) {
   return (text || "").toLowerCase();
 }
 
+/**
+ * Токенизация с морфологическим стеммингом.
+ * Использует единый список стоп-слов из stopwords.js и стеммер из stemmer.js.
+ */
 function tokenize(text) {
-  return normalize(text)
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/[^\p{L}\p{N}а-яё]+/gu, " ")
-    .split(/\s+/)
-    .map(t => t.trim())
-    .filter(t => t.length > 2 && !STOPWORDS.has(t));
+  return stemTokenize(text, STOPWORDS);
+}
+
+/**
+ * Правила автоопределения раздела по имени файла и контенту.
+ * Проверяются в порядке приоритета — первое совпадение побеждает.
+ */
+const TOPIC_RULES = [
+  { topic: "Казначейство",       patterns: [/казначейств|казн|платёж|платеж|zayavka-rds|reestry-platezhej|prognoz-platezhej/i] },
+  { topic: "Транспорт и ГСМ",    patterns: [/транспорт|путев|авто|gsm|диспетч|механик|avtotr|топлив|ГСМ/i] },
+  { topic: "Склад и снабжение",  patterns: [/склад|снабжен|sklad|кладовщик|МПЗ|ордер|перемещен|инвентар|закупк/i] },
+  { topic: "Бюджетирование",     patterns: [/бюджет|byudz|план-факт|финансовое планирование/i] },
+  { topic: "Бухгалтерия",        patterns: [/бухгалтер|бух|проводк|НДС|налог|МСФО|авансовый отчет|buh/i] },
+  { topic: "Закупки и договоры", patterns: [/закупк|договор|поставщик|заказ поставщик|ОМТС|МПЗ/i] },
+  { topic: "Номенклатура и НСИ", patterns: [/номенклатур|nomen|нси|классификатор|НСИ/i] },
+  { topic: "ЭДО",                patterns: [/эдо|электронный документ|vedo|подпис|ЭЦП/i] },
+  { topic: "Методические",       patterns: [/метод|metod|инструкци|памятк|poryadok/i] },
+  { topic: "Доступ и роли",      patterns: [/доступ|роль|ACL|группа пользователей|LUG|acl/i] },
+];
+
+/**
+ * Определяет тематический раздел документа.
+ * Приоритет: 1) явное поле "Раздел:" в тексте, 2) авто по имени файла + заголовку + первым 500 символам.
+ *
+ * @param {string} filename
+ * @param {string} content
+ * @returns {string|null}
+ */
+function detectTopic(filename, content) {
+  // 1. Явное поле в тексте
+  const sectionMatch = content.match(/Раздел:\s*(.+)/);
+  if (sectionMatch) return sectionMatch[1].trim();
+
+  // 2. Авто-детект по имени файла + заголовку + первым 500 символам
+  const sample = (filename + " " + content.slice(0, 500)).toLowerCase();
+  for (const rule of TOPIC_RULES) {
+    if (rule.patterns.some((p) => p.test(sample))) {
+      return rule.topic;
+    }
+  }
+  return null;
 }
 
 function parseHeader(content) {
@@ -52,6 +85,34 @@ function parseHeader(content) {
   header.source = srcMatch ? srcMatch[1].trim() : null;
   header.type = typeMatch ? typeMatch[1].trim() : null;
   return header;
+}
+
+/**
+ * Получает все уникальные разделы из загруженных инструкций.
+ * @returns {string[]}
+ */
+export function listTopics() {
+  const topics = new Set(INSTRUCTION_DOCS.map((d) => d.topic).filter(Boolean));
+  return [...topics].sort();
+}
+
+/**
+ * Возвращает все инструкции из заданного раздела (точное или частичное совпадение).
+ * @param {string} topic
+ * @returns {object[]}
+ */
+export function getInstructionsByTopic(topic) {
+  const q = topic.toLowerCase();
+  return INSTRUCTION_DOCS.filter(
+    (d) => d.topic && d.topic.toLowerCase().includes(q)
+  ).map((d) => ({
+    id: d.id,
+    code: d.code,
+    title: d.title,
+    topic: d.topic,
+    source: d.source,
+    charCount: d.charCount,
+  }));
 }
 
 export function loadKnowledgeBase() {
@@ -76,6 +137,7 @@ export function loadKnowledgeBase() {
     const header = parseHeader(content);
     const titleLine = content.split("\n").find(l => l.startsWith("# ")) || "";
     const title = titleLine.replace(/^#\s+/, "").trim();
+    const topic = detectTopic(file, content);
 
     docs.push({
       id: file,
@@ -84,6 +146,7 @@ export function loadKnowledgeBase() {
       source: header.source,
       type: header.type,
       title: title || file.replace(/\.md$/, ""),
+      topic,
       content,
       tokens: tokenize(content),
       charCount: content.length
@@ -99,6 +162,7 @@ export function listInstructions() {
     id: d.id,
     code: d.code,
     title: d.title,
+    topic: d.topic,
     source: d.source,
     type: d.type,
     charCount: d.charCount
@@ -119,32 +183,46 @@ export function findInstructionCode(code) {
 }
 
 export function searchInstructions(query, { limit = 5 } = {}) {
+  // Токенизация с морфологическим стеммингом
   const qTokens = tokenize(query);
+  // Также сохраняем оригинальные токены для совпадения по code
+  const qRaw = normalize(query);
+
   if (qTokens.length === 0) {
     return { query, total: 0, results: [] };
   }
 
-  // Code exact match boost
   const results = [];
   for (const doc of INSTRUCTION_DOCS) {
     let score = 0;
     const matched = new Set();
+
     for (const tok of qTokens) {
       let hit = false;
-      // title / code match counts more
-      if (doc.title && normalize(doc.title).includes(tok)) { score += 5; hit = true; }
+
+      // Совпадение в заголовке (сравниваем стем с стемами заголовка)
+      const titleStems = tokenize(doc.title || "");
+      if (titleStems.includes(tok)) { score += 5; hit = true; }
+
+      // Совпадение в коде инструкции (без стеммера — точное)
       if (doc.code && normalize(doc.code).includes(tok)) { score += 6; hit = true; }
-      if (normalize(doc.content).includes(tok)) { score += 2; hit = true; }
+
+      // Совпадение в теле (стемированные токены документа)
+      if (doc.tokens.includes(tok)) { score += 2; hit = true; }
+
       if (hit) matched.add(tok);
-      // token frequency in body
+
+      // Частота токена в теле документа
       const freq = doc.tokens.filter(t => t === tok).length;
       score += Math.min(freq, 10) * 1.5;
     }
+
     if (matched.size > 0) {
       results.push({
         id: doc.id,
         code: doc.code,
         title: doc.title,
+        topic: doc.topic,
         score: Math.round(score * 100) / 100,
         matched_tokens: [...matched],
         charCount: doc.charCount

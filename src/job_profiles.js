@@ -108425,14 +108425,46 @@ export const JOB_PROFILES_MAP = {
 };
 
 /**
+ * Проверяет, является ли должность нерепрезентативной (аномальной).
+ *
+ * Критерии аномальности:
+ *   1. Название содержит "<Объект не найден>" — технический мусор из 1С
+ *   2. total_persons < 3 — слишком малая выборка
+ *   3. Все профили имеют pct === 100.0 при total_persons <= 10 —
+ *      признак тестовой/привилегированной учётной записи с полным набором прав
+ *
+ * @param {string} jobTitle
+ * @param {{ total_persons: number, typical_profiles: Array }} data
+ * @returns {{ is_anomaly: boolean, reason: string | null }}
+ */
+export function checkJobAnomaly(jobTitle, data) {
+  if (jobTitle.includes("<Объект не найден>")) {
+    return { is_anomaly: true, reason: "technical_garbage" };
+  }
+  if (data.total_persons < 3) {
+    return { is_anomaly: true, reason: "insufficient_sample" };
+  }
+  const profiles = data.typical_profiles || [];
+  if (
+    profiles.length >= 10 &&
+    profiles.every((p) => p.pct === 100.0) &&
+    data.total_persons <= 10
+  ) {
+    return { is_anomaly: true, reason: "all_profiles_100pct" };
+  }
+  return { is_anomaly: false, reason: null };
+}
+
+/**
  * Найти должности по подстроке (нечёткий поиск).
+ * Исключает технический мусор (<Объект не найден>).
  * @param {string} query
  * @returns {string[]} список совпавших должностей
  */
 export function findJobs(query) {
   const q = query.toLowerCase();
   return Object.keys(JOB_PROFILES_MAP).filter(
-    (job) => job.toLowerCase().includes(q)
+    (job) => job.toLowerCase().includes(q) && !job.includes("<Объект не найден>")
   );
 }
 
