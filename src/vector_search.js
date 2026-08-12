@@ -25,6 +25,44 @@ function tokenize(text) {
 /** @type {{ vocab: Map, docVectors: Map, docs: Map, builtAt: Date } | null} */
 export let tfidfIndex = null;
 
+// ─── Простой LRU-кэш для результатов поиска ──────────────────────────────────
+
+const SEARCH_CACHE_MAX = 100;
+/** @type {Map<string, { result: object, at: number }>} */
+const searchCache = new Map();
+
+function cacheKey(query, limit, minScore) {
+  return `${query}|${limit}|${minScore}`;
+}
+
+function cacheGet(key) {
+  const entry = searchCache.get(key);
+  if (!entry) return null;
+  // Перемещаем в конец (LRU — самый новый в конце)
+  searchCache.delete(key);
+  searchCache.set(key, entry);
+  return entry.result;
+}
+
+function cacheSet(key, result) {
+  if (searchCache.size >= SEARCH_CACHE_MAX) {
+    // Удаляем самый старый (первый)
+    const firstKey = searchCache.keys().next().value;
+    searchCache.delete(firstKey);
+  }
+  searchCache.set(key, { result, at: Date.now() });
+}
+
+/** Сбрасывает кэш поиска (вызывается при перезагрузке базы знаний). */
+export function clearSearchCache() {
+  searchCache.clear();
+}
+
+/** Возвращает статистику кэша. */
+export function getSearchCacheStats() {
+  return { size: searchCache.size, max: SEARCH_CACHE_MAX };
+}
+
 // ─── buildTfidfIndex ──────────────────────────────────────────────────────────
 
 /**
@@ -115,6 +153,9 @@ export function buildTfidfIndex(docs) {
     builtAt: new Date()
   };
 
+  // Сбрасываем кэш поиска — индекс изменился
+  clearSearchCache();
+
   return tfidfIndex;
 }
 
@@ -160,6 +201,11 @@ export function tfidfSearch(query, { limit = 5, minScore = 0.01 } = {}) {
   if (!tfidfIndex) {
     throw new Error("tfidfSearch: индекс не построен. Вызовите buildTfidfIndex() сначала.");
   }
+
+  // ── Проверяем кэш ────────────────────────────────────────────────────────
+  const key = cacheKey(query, limit, minScore);
+  const cached = cacheGet(key);
+  if (cached) return cached;
 
   const { vocab, docVectors, docs } = tfidfIndex;
 
@@ -233,11 +279,16 @@ export function tfidfSearch(query, { limit = 5, minScore = 0.01 } = {}) {
   scored.sort((a, b) => b.score - a.score);
   const results = scored.slice(0, limit);
 
-  return {
+  const searchResult = {
     query,
     total: scored.length,
     results
   };
+
+  // Сохраняем в кэш
+  cacheSet(key, searchResult);
+
+  return searchResult;
 }
 
 // ─── getIndexStats ────────────────────────────────────────────────────────────

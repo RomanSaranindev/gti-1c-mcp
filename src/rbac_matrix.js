@@ -5540,6 +5540,70 @@ export function suggestProfile(requestText = "", roles = []) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Утилиты согласования — единая реализация, используется во всех инструментах
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Вычисляет уровень согласования по флагам профиля/функции.
+ *
+ * @param {{ requires_chief_accountant?: boolean, requires_transport_head?: boolean, requires_procurement_director?: boolean }} flags
+ * @returns {"standard" | "accounting" | "transport" | "transport_accounting" | "procurement"}
+ */
+export function computeApprovalLevel(flags = {}) {
+  const acc = Boolean(flags.requires_chief_accountant);
+  const tr  = Boolean(flags.requires_transport_head);
+  const pr  = Boolean(flags.requires_procurement_director);
+  if (acc && tr) return "transport_accounting";
+  if (acc)       return "accounting";
+  if (tr)        return "transport";
+  if (pr)        return "procurement";
+  return "standard";
+}
+
+/**
+ * Вычисляет агрегированный уровень согласования по массиву флагов.
+ *
+ * @param {Array<{ requires_chief_accountant?: boolean, requires_transport_head?: boolean, requires_procurement_director?: boolean }>} flagsArray
+ * @returns {"standard" | "accounting" | "transport" | "transport_accounting" | "procurement"}
+ */
+export function computeApprovalLevelMany(flagsArray = []) {
+  const acc = flagsArray.some((f) => f.requires_chief_accountant);
+  const tr  = flagsArray.some((f) => f.requires_transport_head);
+  const pr  = flagsArray.some((f) => f.requires_procurement_director);
+  return computeApprovalLevel({ requires_chief_accountant: acc, requires_transport_head: tr, requires_procurement_director: pr });
+}
+
+/**
+ * Формирует список согласующих лиц.
+ *
+ * @param {{ requires_chief_accountant?: boolean, requires_transport_head?: boolean, requires_procurement_director?: boolean }} flags
+ * @returns {string[]}
+ */
+export function formatApprovers(flags = {}) {
+  const list = ["Линейный руководитель (всегда)"];
+  if (flags.requires_chief_accountant) list.push("Главный бухгалтер (есть роли БУ/НУ или казначейства)");
+  if (flags.requires_transport_head)   list.push("Руководитель отдела АТ (есть транспортные роли)");
+  if (flags.requires_procurement_director) list.push("Директор по закупкам (есть роли закупок)");
+  return list;
+}
+
+/**
+ * Возвращает человекочитаемое описание уровня согласования.
+ *
+ * @param {"standard"|"accounting"|"transport"|"transport_accounting"|"procurement"} level
+ * @returns {string}
+ */
+export function describeApprovalLevel(level) {
+  return {
+    standard:             "Стандартное — только линейный руководитель",
+    accounting:           "Расширенное — руководитель + главный бухгалтер",
+    transport:            "Транспортное — руководитель + руководитель АТ",
+    transport_accounting: "Комплексное — руководитель + главный бухгалтер + руководитель АТ",
+    procurement:          "Закупочное — руководитель + директор по закупкам",
+  }[level] || "Неизвестный уровень";
+}
+
 /**
  * Формирует системный промпт для LLM с полной матрицей ролей и профилями доступа.
  */

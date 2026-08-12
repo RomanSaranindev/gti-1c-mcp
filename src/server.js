@@ -4,36 +4,36 @@
  * Транспорт: Streamable HTTP (stateful, SDK 1.12+)
  * Порт: 3031 (по умолчанию)
  *
- * Инструменты (19):
+ * Инструменты (18):
  *
  * База знаний инструкций 1С.БИТ:
- *   1. list_instructions              — список всех инструкций (с фильтрами по коду/ключевому слову)
- *   2. search_instructions            — полнотекстовый поиск по базе знаний
+ *   1. list_instructions              — список инструкций (фильтры: code, keyword, topic, list_topics)
+ *   2. search_instructions            — поиск: keyword / semantic (TF-IDF + embedding) / auto
  *   3. get_instruction                — полный текст инструкции по id или коду (ИП-301 и т.д.)
- *   4. semantic_search_instructions   — TF-IDF + cosine similarity поиск (семантический)
- *   5. list_instructions_by_topic     — инструкции по тематическому разделу
  *
  * Профили доступа и матрица ролей RBAC:
- *   6. suggest_access_profile         — keyword-подбор профиля группы доступа (без LLM)
- *   7. get_roles_matrix               — полная матрица ролей RBAC
- *   8. validate_roles                 — проверка корректности набора ролей
- *   9. get_approval_level             — уровень согласования по набору ролей
- *  10. get_profiles_by_function       — профили доступа по бизнес-функции RBAC
+ *   4. suggest_access_profile         — подбор профиля (двухшаговый протокол + generate_request_text)
+ *   5. get_roles_matrix               — полная матрица ролей RBAC с фильтрами
+ *   6. analyze_roles                  — валидация + уровень согласования за один вызов
+ *   7. get_profiles_by_function       — профили доступа по бизнес-функции RBAC
+ *   8. explain_profile                — объяснение профиля на языке бизнеса
+ *   9. search_by_role                 — поиск профилей и бизнес-функций по роли 1С
  *
  * Маппинг должность → профили (обезличенные данные сотрудников):
- *  11. suggest_profile_by_job         — типовые профили по названию должности (417 должностей)
- *  12. list_jobs                      — список должностей из базы данных
+ *  10. suggest_profile_by_job         — типовые профили по названию должности (include_explanation)
+ *  11. list_jobs                      — список должностей из базы данных
  *
- * Объяснение и поиск по ролям:
- *  13. explain_profile                — объяснение профиля на языке бизнеса
- *  14. search_by_role                 — поиск профилей и бизнес-функций по роли 1С
+ * Связка инструкция ↔ доступ:
+ *  12. get_instruction_access_requirements — профили и роли, нужные для инструкции (topic-маппинг)
+ *  13. get_user_access_journey             — полная цепочка должность→профиль→роли→согласование
  *
  * Живая база 1С (требует расширение + ONEC_* в .env):
- *  15. onec_health                    — статус подключения к 1С
- *  16. list_1c_users                  — список пользователей базы
- *  17. get_1c_access_groups           — группы доступа пользователя
- *  18. execute_1c_query               — произвольный запрос к данным 1С
- *  19. get_1c_metadata                — метаданные конфигурации 1С
+ *  14. onec_health                    — статус подключения к 1С (кэш 60 сек)
+ *  15. list_1c_users                  — список пользователей базы
+ *  16. get_1c_access_groups           — группы доступа пользователя
+ *  17. execute_1c_query               — произвольный запрос к данным 1С
+ *  18. get_1c_metadata                — метаданные конфигурации 1С
+ *  19. get_1c_documents               — документы БИТ.ФИНАНС с фильтрацией
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -53,6 +53,10 @@ import {
   suggestProfile,
   suggestProfiles,
   getProfilesByFunction,
+  computeApprovalLevel,
+  computeApprovalLevelMany,
+  formatApprovers,
+  describeApprovalLevel,
 } from "./rbac_matrix.js";
 
 import {
@@ -76,6 +80,8 @@ import {
   buildTfidfIndex,
   tfidfSearch,
   getIndexStats,
+  getSearchCacheStats,
+  clearSearchCache,
 } from "./vector_search.js";
 
 import {
@@ -317,19 +323,55 @@ function enrichRequestText(requestText, questions, answers) {
 function registerTools(server) {
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 1: list_instructions
+  // ИНСТРУМЕНТ 1: list_instructions  (объединяет бывший list_instructions_by_topic)
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.tool(
     "list_instructions",
-    "Возвращает список инструкций пользователя 1С.БИТ, загруженных в базу знаний MCP сервера. " +
-    "Каждая инструкция имеет id, код (ИП-XXX), название и источник.",
+    "Возвращает список инструкций пользователя 1С.БИТ из базы знаний MCP сервера. " +
+    "Поддерживает фильтрацию по коду (ИП-301), ключевому слову в названии и тематическому разделу. " +
+    "Доступные разделы: Казначейство, Транспорт и ГСМ, Склад и снабжение, Бюджетирование, " +
+    "Бухгалтерия, Закупки и договоры, Номенклатура и НСИ, ЭДО, Методические, Доступ и роли. " +
+    "Параметр list_topics=true вернёт список всех разделов с количеством инструкций.",
     {
-      filter_code: z.string().optional().describe("Фильтр по коду инструкции, например 'ИП-301'"),
-      filter_keyword: z.string().optional().describe("Фильтр по ключевому слову в названии"),
+      filter_code: z.string().optional().describe(
+        "Фильтр по коду инструкции, например 'ИП-301'"
+      ),
+      filter_keyword: z.string().optional().describe(
+        "Фильтр по ключевому слову в названии"
+      ),
+      topic: z.string().optional().describe(
+        "Фильтр по тематическому разделу (частичное совпадение). " +
+        "Например: 'Казначейство', 'Транспорт', 'Склад'"
+      ),
+      list_topics: z.boolean().optional().describe(
+        "Если true — вернуть только список разделов с количеством инструкций в каждом"
+      ),
     },
-    async ({ filter_code, filter_keyword }) => {
-      let docs = listInstructions();
+    async ({ filter_code, filter_keyword, topic, list_topics }) => {
+
+      // ── Режим: вернуть список разделов ──────────────────────────────────────
+      if (list_topics) {
+        const topics = listTopics();
+        const topicStats = topics.map((t) => ({
+          topic: t,
+          instructions_count: getInstructionsByTopic(t).length,
+        }));
+        const withoutTopic = listInstructions().filter((d) => !d.topic);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              available_topics: topicStats,
+              without_topic_count: withoutTopic.length,
+              hint: "Используйте параметр topic='Казначейство' для фильтрации по разделу.",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // ── Режим: список инструкций с фильтрами ────────────────────────────────
+      let docs = topic ? getInstructionsByTopic(topic) : listInstructions();
 
       if (filter_code) {
         const norm = filter_code.toUpperCase().replace(/\s+/g, "");
@@ -342,115 +384,113 @@ function registerTools(server) {
         docs = docs.filter(
           (d) =>
             (d.title || "").toLowerCase().includes(kw) ||
-            (d.code || "").toLowerCase().includes(kw)
+            (d.code  || "").toLowerCase().includes(kw)
         );
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ total: docs.length, instructions: docs }, null, 2),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            total: docs.length,
+            filters: { filter_code, filter_keyword, topic },
+            instructions: docs,
+            hint: docs.length > 0
+              ? "Используйте get_instruction(id) для получения полного текста инструкции."
+              : "Инструкции не найдены. Попробуйте list_instructions(list_topics=true) чтобы увидеть доступные разделы.",
+          }, null, 2),
+        }],
       };
     }
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 5: list_instructions_by_topic
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  server.tool(
-    "list_instructions_by_topic",
-    "Возвращает все инструкции 1С.БИТ из указанного тематического раздела. " +
-    "Доступные разделы: Казначейство, Транспорт и ГСМ, Склад и снабжение, Бюджетирование, " +
-    "Бухгалтерия, Закупки и договоры, Номенклатура и НСИ, ЭДО, Методические, Доступ и роли. " +
-    "Без параметра topic возвращает все доступные разделы с количеством инструкций.",
-    {
-      topic: z.string().optional().describe(
-        "Название тематического раздела (частичное совпадение). " +
-        "Например: 'Казначейство', 'Транспорт', 'Склад'. " +
-        "Если не указан — возвращает список всех разделов."
-      ),
-    },
-    async ({ topic }) => {
-      if (!topic) {
-        // Вернуть список разделов с количеством инструкций
-        const topics = listTopics();
-        const topicStats = topics.map((t) => {
-          const count = getInstructionsByTopic(t).length;
-          return { topic: t, instructions_count: count };
-        });
-        // Добавляем инструкции без раздела
-        const all = listInstructions();
-        const withoutTopic = all.filter((d) => !d.topic);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  available_topics: topicStats,
-                  without_topic_count: withoutTopic.length,
-                  hint: "Укажите topic для получения инструкций по разделу. " +
-                    "Например: list_instructions_by_topic(topic='Казначейство')",
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-
-      const results = getInstructionsByTopic(topic);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                topic_query: topic,
-                found: results.length,
-                instructions: results,
-                hint: results.length === 0
-                  ? "Инструкции не найдены. Проверьте название раздела через list_instructions_by_topic() без параметров."
-                  : `Найдено ${results.length} инструкций. Используйте get_instruction(id) для получения полного текста.`,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 2: search_instructions
+  // ИНСТРУМЕНТ 2: search_instructions  (объединяет бывший semantic_search_instructions)
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.tool(
     "search_instructions",
-    "Ищет инструкции пользователя 1С.БИТ по ключевым словам (полнотекстовый поиск по базе знаний). " +
-    "Возвращает релевантные инструкции с оценкой соответствия. " +
-    "Используйте для ответа на вопросы 'как сформировать...', 'где найти...', 'как заполнить...' в 1С.БИТ.",
+    "Ищет инструкции пользователя 1С.БИТ по запросу. " +
+    "Режим mode='auto' (по умолчанию): сначала пробует нейронные эмбеддинги, затем TF-IDF + cosine. " +
+    "Режим mode='semantic': TF-IDF + cosine similarity (понимает синонимы и смысл запроса). " +
+    "Режим mode='keyword': точный полнотекстовый поиск по словам. " +
+    "Используйте для ответов на вопросы 'как оформить...', 'где найти...', 'как заполнить...' в 1С.БИТ.",
     {
       query: z.string().describe(
-        "Поисковый запрос, например 'путевой лист', 'приходный ордер от поставщика', 'поправочные коэффициенты ГСМ'"
+        "Поисковый запрос на русском языке. " +
+        "Например: 'путевой лист', 'приходный ордер от поставщика', 'как оформить расход топлива'"
       ),
       limit: z.number().int().min(1).max(20).default(5).describe(
         "Максимум результатов (по умолчанию 5)"
       ),
+      mode: z.enum(["auto", "semantic", "keyword"]).default("auto").describe(
+        "'auto' — embedding если готов, иначе TF-IDF (рекомендуется). " +
+        "'semantic' — TF-IDF + cosine (офлайн, всегда доступен). " +
+        "'keyword' — точный полнотекстовый поиск."
+      ),
+      min_score: z.number().min(0).max(1).default(0.01).describe(
+        "Минимальный порог релевантности (0.0–1.0). " +
+        "Для embedding-режима рекомендуется 0.3+"
+      ),
     },
-    async ({ query, limit }) => {
-      const result = searchInstructions(query, { limit });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+    async ({ query, limit, mode, min_score }) => {
+
+      // ── Режим keyword ────────────────────────────────────────────────────
+      if (mode === "keyword") {
+        const result = searchInstructions(query, { limit });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ...result, search_mode: "keyword" }, null, 2) }],
+        };
+      }
+
+      // ── Режим auto / semantic: пробуем embedding ─────────────────────────
+      if (mode === "auto" || mode === "semantic") {
+        if (mode === "auto") {
+          const embStats = getEmbeddingStats();
+          if (embStats.is_ready) {
+            const embResult = await embeddingSearch(query, { limit, minScore: min_score });
+            if (embResult) {
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    ...embResult,
+                    search_mode: "embedding",
+                    model: embStats.model,
+                  }, null, 2),
+                }],
+              };
+            }
+          }
+        }
+
+        // TF-IDF fallback (или явный mode='semantic')
+        const stats = getIndexStats();
+        if (!stats.ready) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Индекс поиска не готов. Подождите несколько секунд после старта сервера.",
+                fallback_hint: "Используйте mode='keyword' для немедленного поиска.",
+                embedding_status: getEmbeddingStats(),
+              }, null, 2),
+            }],
+          };
+        }
+
+        const result = tfidfSearch(query, { limit, minScore: min_score });
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ...result,
+              search_mode: mode === "auto" ? "tfidf_fallback" : "tfidf",
+              embedding_status: getEmbeddingStats(),
+            }, null, 2),
+          }],
+        };
+      }
     }
   );
 
@@ -522,81 +562,7 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 4: semantic_search_instructions (Embedding → TF-IDF fallback)
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  server.tool(
-    "semantic_search_instructions",
-    "Семантический поиск по инструкциям 1С.БИТ. " +
-    "Если модель multilingual-e5-small загружена — использует нейронные эмбеддинги (понимает синонимы и смысл). " +
-    "Если модель недоступна — автоматически переходит на TF-IDF + косинусное сходство. " +
-    "Например: 'как оформить расход топлива' найдёт инструкции по ГСМ даже если слово 'топливо' там не написано.",
-    {
-      query: z.string().describe(
-        "Поисковый запрос на естественном языке. Например: " +
-        "'как оформить командировку', 'расход топлива диспетчер', 'согласование платежа'"
-      ),
-      limit: z.number().int().min(1).max(20).default(5).describe(
-        "Максимум результатов (по умолчанию 5)"
-      ),
-      min_score: z.number().min(0).max(1).default(0.01).describe(
-        "Минимальный порог релевантности (0.0–1.0, по умолчанию 0.01). " +
-        "Для embedding-режима рекомендуется 0.3+"
-      ),
-    },
-    async ({ query, limit, min_score }) => {
-      // 1. Пробуем нейронные эмбеддинги
-      const embStats = getEmbeddingStats();
-      if (embStats.is_ready) {
-        const embResult = await embeddingSearch(query, { limit, minScore: min_score });
-        if (embResult) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                ...embResult,
-                search_mode: "embedding",
-                model: embStats.model,
-              }, null, 2),
-            }],
-          };
-        }
-      }
-
-      // 2. Fallback на TF-IDF
-      const stats = getIndexStats();
-      if (!stats.ready) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              error: "Ни embedding-индекс, ни TF-IDF индекс не готовы. " +
-                "Попробуйте через несколько секунд после старта сервера.",
-              fallback: "Используйте search_instructions для keyword-поиска.",
-              embedding_status: embStats,
-            }, null, 2),
-          }],
-        };
-      }
-
-      const result = tfidfSearch(query, { limit, minScore: min_score });
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            ...result,
-            search_mode: "tfidf_fallback",
-            embedding_status: embStats,
-            index_stats: stats,
-          }, null, 2),
-        }],
-      };
-    }
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 5: suggest_access_profile (нумерация сдвинута)
+  // ИНСТРУМЕНТ 4: suggest_access_profile
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.tool(
@@ -613,7 +579,8 @@ function registerTools(server) {
     "ШАГ 2: Вызовите инструмент повторно с параметром `answers` — массивом строк " +
     "(ответы в том же порядке, что и вопросы из шага 1). " +
     "Сервер обогатит запрос ответами и вернёт подобранные профили.\n" +
-    "ВАЖНО: Никогда не пропускайте шаг 1. Не передавайте answers при первом вызове.",
+    "ВАЖНО: Никогда не пропускайте шаг 1. Не передавайте answers при первом вызове.\n\n" +
+    "Параметр generate_request_text=true (шаг 2) дополнительно формирует готовый текст заявки на доступ.",
     {
       request_text: z.string().describe(
         "Описание задач или функций сотрудника. " +
@@ -628,17 +595,11 @@ function registerTools(server) {
         "Должны идти в том же порядке, что и вопросы в поле `questions` ответа NEED_CLARIFICATION. " +
         "Если параметр не передан — сервер вернёт вопросы (шаг 1)."
       ),
+      generate_request_text: z.boolean().optional().describe(
+        "Если true (шаг 2) — добавить в ответ готовый текст заявки на предоставление доступа."
+      ),
     },
-    async ({ request_text, mode, answers }) => {
-      const approvalNote = (p) => {
-        const parts = [];
-        if (p.requires_chief_accountant) parts.push("главный бухгалтер");
-        if (p.requires_transport_head) parts.push("руководитель АТ");
-        if (p.requires_procurement_director) parts.push("директор по закупкам");
-        return parts.length > 0
-          ? `Требуется согласование: руководитель + ${parts.join(" + ")}`
-          : "Стандартное согласование: только линейный руководитель";
-      };
+    async ({ request_text, mode, answers, generate_request_text }) => {
 
       // ── ШАГ 1: answers не переданы — вернуть уточняющие вопросы ───────────
       if (!answers) {
@@ -677,78 +638,86 @@ function registerTools(server) {
       const questions = buildAdaptiveQuestions(request_text);
       const enrichedText = enrichRequestText(request_text, questions, answers);
 
+      // Вспомогательная функция формирования текста заявки
+      const makeRequestText = (profileNames, flags) => {
+        const jobAnswer  = answers[0] || request_text;
+        const deptAnswer = answers[1] || "не указано";
+        return [
+          "Прошу предоставить доступ в 1С:БИТ.ФИНАНС для сотрудника.",
+          `Должность: ${jobAnswer}`,
+          `Подразделение: ${deptAnswer}`,
+          `Запрашиваемые профили групп доступа: ${profileNames}`,
+          `Обоснование: ${request_text}`,
+          flags.requires_chief_accountant ? "\nВНИМАНИЕ: Профили требуют согласования главного бухгалтера." : "",
+          flags.requires_transport_head   ? "\nВНИМАНИЕ: Профили требуют согласования руководителя АТ." : "",
+        ].filter(Boolean).join("\n");
+      };
+
       // ── Режим multi ────────────────────────────────────────────────────────
       if (mode === "multi") {
         const all = suggestProfiles(enrichedText);
 
         if (all.length === 0) {
           return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    status: "NO_MATCH",
-                    result: null,
-                    message: "Не удалось подобрать профили. Уточните описание задач.",
-                    enriched_request: enrichedText,
-                    available_profiles: ACCESS_PROFILES.map((p) => ({
-                      id: p.id,
-                      name: p.name,
-                      description: p.description,
-                    })),
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "NO_MATCH",
+                result: null,
+                message: "Не удалось подобрать профили. Уточните описание задач.",
+                enriched_request: enrichedText,
+                available_profiles: ACCESS_PROFILES.map((p) => ({
+                  id: p.id, name: p.name, description: p.description,
+                })),
+              }, null, 2),
+            }],
           };
         }
 
-        const needsChief = all.some((r) => r.profile.requires_chief_accountant);
-        const needsTransport = all.some((r) => r.profile.requires_transport_head);
-        const needsProcurement = all.some((r) => r.profile.requires_procurement_director);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  status: "OK",
-                  mode: "multi",
-                  enriched_request: enrichedText,
-                  total_profiles: all.length,
-                  recommended_profiles: all.map((r) => ({
-                    id: r.profile.id,
-                    name: r.profile.name,
-                    description: r.profile.description,
-                    ...(r.profile.notes ? { notes: r.profile.notes } : {}),
-                    key_roles: r.profile.key_roles,
-                    requires_chief_accountant: r.profile.requires_chief_accountant,
-                    requires_transport_head: r.profile.requires_transport_head,
-                    requires_procurement_director: r.profile.requires_procurement_director || false,
-                    match_score: r.score,
-                    explanation: r.explanation,
-                  })),
-                  approval_summary: {
-                    requires_chief_accountant: needsChief,
-                    requires_transport_head: needsTransport,
-                    requires_procurement_director: needsProcurement,
-                    approval_note: approvalNote({
-                      requires_chief_accountant: needsChief,
-                      requires_transport_head: needsTransport,
-                      requires_procurement_director: needsProcurement,
-                    }),
-                  },
-                },
-                null,
-                2
-              ),
-            },
-          ],
+        const aggFlags = {
+          requires_chief_accountant:    all.some((r) => r.profile.requires_chief_accountant),
+          requires_transport_head:      all.some((r) => r.profile.requires_transport_head),
+          requires_procurement_director: all.some((r) => r.profile.requires_procurement_director),
         };
+        const approvalLevel = computeApprovalLevel(aggFlags);
+
+        const response = {
+          status: "OK",
+          mode: "multi",
+          enriched_request: enrichedText,
+          total_profiles: all.length,
+          recommended_profiles: all.map((r) => ({
+            id: r.profile.id,
+            name: r.profile.name,
+            description: r.profile.description,
+            ...(r.profile.notes ? { notes: r.profile.notes } : {}),
+            key_roles: r.profile.key_roles,
+            requires_chief_accountant:    r.profile.requires_chief_accountant,
+            requires_transport_head:      r.profile.requires_transport_head,
+            requires_procurement_director: r.profile.requires_procurement_director || false,
+            match_score: r.score,
+            explanation: r.explanation,
+          })),
+          approval_summary: {
+            ...aggFlags,
+            approval_level: approvalLevel,
+            approval_description: describeApprovalLevel(approvalLevel),
+            approvers_required: formatApprovers(aggFlags),
+          },
+        };
+
+        if (generate_request_text) {
+          const profileNames = all.map((r) => r.profile.name).join(", ");
+          response.ready_to_use_request_text = makeRequestText(profileNames, aggFlags);
+          response.next_steps = [
+            "1. Передайте текст заявки (ready_to_use_request_text) ответственному за IT-доступ.",
+            aggFlags.requires_chief_accountant ? "2. Получите подпись главного бухгалтера на заявке." : null,
+            aggFlags.requires_transport_head   ? "3. Получите подпись руководителя АТ на заявке." : null,
+            "4. Администратор 1С создаст пользователя и назначит указанные профили групп доступа.",
+          ].filter(Boolean);
+        }
+
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
       }
 
       // ── Режим single ───────────────────────────────────────────────────────
@@ -756,58 +725,54 @@ function registerTools(server) {
 
       if (!profile || score === 0) {
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  status: "NO_MATCH",
-                  result: null,
-                  message: "Не удалось подобрать профиль. Уточните описание задач.",
-                  enriched_request: enrichedText,
-                  available_profiles: ACCESS_PROFILES.map((p) => ({
-                    id: p.id,
-                    name: p.name,
-                    description: p.description,
-                  })),
-                },
-                null,
-                2
-              ),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "NO_MATCH",
+              result: null,
+              message: "Не удалось подобрать профиль. Уточните описание задач.",
+              enriched_request: enrichedText,
+              available_profiles: ACCESS_PROFILES.map((p) => ({
+                id: p.id, name: p.name, description: p.description,
+              })),
+            }, null, 2),
+          }],
         };
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                status: "OK",
-                mode: "single",
-                enriched_request: enrichedText,
-                  recommended_profile: {
-                  id: profile.id,
-                  name: profile.name,
-                  description: profile.description,
-                  ...(profile.notes ? { notes: profile.notes } : {}),
-                  key_roles: profile.key_roles,
-                  requires_chief_accountant: profile.requires_chief_accountant,
-                  requires_transport_head: profile.requires_transport_head,
-                  requires_procurement_director: profile.requires_procurement_director || false,
-                },
-                match_score: score,
-                explanation,
-                approval_note: approvalNote(profile),
-              },
-              null,
-              2
-            ),
-          },
-        ],
+      const approvalLevel = computeApprovalLevel(profile);
+      const response = {
+        status: "OK",
+        mode: "single",
+        enriched_request: enrichedText,
+        recommended_profile: {
+          id: profile.id,
+          name: profile.name,
+          description: profile.description,
+          ...(profile.notes ? { notes: profile.notes } : {}),
+          key_roles: profile.key_roles,
+          requires_chief_accountant:    profile.requires_chief_accountant,
+          requires_transport_head:      profile.requires_transport_head,
+          requires_procurement_director: profile.requires_procurement_director || false,
+        },
+        match_score: score,
+        explanation,
+        approval_level: approvalLevel,
+        approval_description: describeApprovalLevel(approvalLevel),
+        approvers_required: formatApprovers(profile),
       };
+
+      if (generate_request_text) {
+        response.ready_to_use_request_text = makeRequestText(profile.name, profile);
+        response.next_steps = [
+          "1. Передайте текст заявки (ready_to_use_request_text) ответственному за IT-доступ.",
+          profile.requires_chief_accountant ? "2. Получите подпись главного бухгалтера на заявке." : null,
+          profile.requires_transport_head   ? "3. Получите подпись руководителя АТ на заявке." : null,
+          "4. Администратор 1С создаст пользователя и назначит указанный профиль группы доступа.",
+        ].filter(Boolean);
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
     }
   );
 
@@ -863,46 +828,87 @@ function registerTools(server) {
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 6: validate_roles
+  // ИНСТРУМЕНТ 6: analyze_roles  (объединяет validate_roles + get_approval_level)
   // ═══════════════════════════════════════════════════════════════════════════
 
   server.tool(
-    "validate_roles",
-    "Проверяет корректность набора ролей 1С: какие роли существуют в матрице, " +
-    "какие не найдены, и рекомендует обязательные роли.",
+    "analyze_roles",
+    "Анализирует набор ролей 1С за один вызов: " +
+    "проверяет корректность (какие роли найдены в матрице, какие обязательные отсутствуют) и " +
+    "определяет уровень согласования (standard / accounting / transport / transport_accounting / procurement). " +
+    "Заменяет отдельные вызовы validate_roles и get_approval_level.",
     {
-      roles: z.array(z.string()).describe("Массив наименований ролей для проверки"),
+      roles: z.array(z.string()).describe("Массив наименований ролей 1С для анализа"),
+      include_validation: z.boolean().default(true).describe(
+        "Включать проверку наличия ролей в матрице и обязательных ролей (по умолчанию true)"
+      ),
+      include_approval: z.boolean().default(true).describe(
+        "Включать определение уровня согласования (по умолчанию true)"
+      ),
     },
-    async ({ roles }) => {
-      const knownRoles = new Set();
-      RBAC_MATRIX.mandatory_roles.roles.forEach((r) => knownRoles.add(r));
-      RBAC_MATRIX.business_functions.forEach((f) => f.roles.forEach((r) => knownRoles.add(r)));
+    async ({ roles, include_validation, include_approval }) => {
+      const result = {};
 
-      const found = roles.filter((r) => knownRoles.has(r));
-      const notFound = roles.filter((r) => !knownRoles.has(r));
-      const missing = RBAC_MATRIX.mandatory_roles.roles.filter((r) => !roles.includes(r));
+      // ── Валидация ──────────────────────────────────────────────────────────
+      if (include_validation) {
+        const knownRoles = new Set();
+        RBAC_MATRIX.mandatory_roles.roles.forEach((r) => knownRoles.add(r));
+        RBAC_MATRIX.business_functions.forEach((f) => f.roles.forEach((r) => knownRoles.add(r)));
+
+        const found    = roles.filter((r) =>  knownRoles.has(r));
+        const notFound = roles.filter((r) => !knownRoles.has(r));
+        const missing  = RBAC_MATRIX.mandatory_roles.roles.filter((r) => !roles.includes(r));
+
+        result.validation = {
+          total_checked:       roles.length,
+          found_in_matrix:     found,
+          not_found_in_matrix: notFound,
+          missing_mandatory:   missing,
+          is_valid:            notFound.length === 0 && missing.length === 0,
+          recommendations:     missing.length > 0
+            ? `Добавьте обязательные роли: ${missing.join(", ")}`
+            : "Набор ролей корректен.",
+        };
+      }
+
+      // ── Уровень согласования ───────────────────────────────────────────────
+      if (include_approval) {
+        let requiresAccounting  = false;
+        let requiresTransport   = false;
+        let requiresProcurement = false;
+        const matchedFunctions  = [];
+
+        for (const func of RBAC_MATRIX.business_functions) {
+          if (func.roles.some((r) => roles.includes(r))) {
+            matchedFunctions.push(func.display_name);
+            if (func.requires_chief_accountant) requiresAccounting = true;
+            if (func.requires_transport_head)   requiresTransport  = true;
+          }
+        }
+        for (const p of ACCESS_PROFILES) {
+          if (p.requires_procurement_director && p.key_roles.some((r) => roles.includes(r))) {
+            requiresProcurement = true;
+          }
+        }
+
+        const flags = {
+          requires_chief_accountant:    requiresAccounting,
+          requires_transport_head:      requiresTransport,
+          requires_procurement_director: requiresProcurement,
+        };
+        const level = computeApprovalLevel(flags);
+
+        result.approval = {
+          approval_level:            level,
+          approval_description:      describeApprovalLevel(level),
+          approvers_required:        formatApprovers(flags),
+          matched_business_functions: matchedFunctions,
+          ...flags,
+        };
+      }
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                total_checked: roles.length,
-                found_in_matrix: found,
-                not_found_in_matrix: notFound,
-                missing_mandatory: missing,
-                is_valid: notFound.length === 0 && missing.length === 0,
-                recommendations:
-                  missing.length > 0
-                    ? `Добавьте обязательные роли: ${missing.join(", ")}`
-                    : "Набор ролей корректен.",
-              },
-              null,
-              2
-            ),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify({ roles_analyzed: roles, ...result }, null, 2) }],
       };
     }
   );
@@ -917,7 +923,8 @@ function registerTools(server) {
     "Использует реальные обезличенные данные из базы сотрудников (417 должностей). " +
     "Возвращает профили, которые встречаются у >= 40% сотрудников данной должности, " +
     "с указанием % охвата и количества сотрудников. " +
-    "Поддерживает нечёткий поиск по подстроке названия должности.",
+    "Поддерживает нечёткий поиск по подстроке названия должности. " +
+    "Параметр include_explanation=true добавляет к каждому профилю описание возможностей и уровень согласования.",
     {
       job_title: z.string().describe(
         "Название должности сотрудника. Например: 'кладовщик', 'бухгалтер', 'механик', 'диспетчер'. " +
@@ -929,8 +936,12 @@ function registerTools(server) {
       limit: z.number().int().min(1).max(50).default(20).describe(
         "Максимальное количество профилей в ответе (по умолчанию 20)"
       ),
+      include_explanation: z.boolean().default(false).describe(
+        "Если true — добавить к каждому профилю can_do (что сможет делать сотрудник) " +
+        "и approval_level (уровень согласования). Устраняет необходимость дополнительного вызова explain_profile."
+      ),
     },
-    async ({ job_title, min_pct, limit }) => {
+    async ({ job_title, min_pct, limit, include_explanation }) => {
       // Точное совпадение
       let exactData = getJobProfiles(job_title);
       let matchedJob = exactData ? job_title : null;
@@ -981,6 +992,25 @@ function registerTools(server) {
 
       const otherMatches = allMatches.filter((j) => j !== matchedJob).slice(0, 5);
 
+      // Строим объяснение для каждого профиля если запрошено
+      const buildProfileExplanation = (profileName) => {
+        const p = ACCESS_PROFILES.find((ap) => ap.name === profileName || ap.id === profileName);
+        if (!p) return null;
+        const rolesSet = new Set((p.key_roles || []).map((r) => r.toLowerCase()));
+        const matchedBF = RBAC_MATRIX.business_functions.filter((bf) =>
+          bf.roles.some((r) => rolesSet.has(r.toLowerCase()))
+        );
+        const canDo = matchedBF.map((bf) => bf.description).filter(Boolean);
+        if (canDo.length === 0 && p.description) canDo.push(p.description);
+        const level = computeApprovalLevel(p);
+        return {
+          can_do: canDo,
+          approval_level:       level,
+          approval_description: describeApprovalLevel(level),
+          approvers_required:   formatApprovers(p),
+        };
+      };
+
       return {
         content: [
           {
@@ -1005,11 +1035,18 @@ function registerTools(server) {
                           : "Нерепрезентативные данные.",
                     }
                   : { is_anomaly: false },
-                typical_profiles: filtered.map((p) => ({
-                  profile: p.profile,
-                  coverage_pct: p.pct,
-                  persons_count: p.count,
-                })),
+                typical_profiles: filtered.map((p) => {
+                  const base = {
+                    profile: p.profile,
+                    coverage_pct: p.pct,
+                    persons_count: p.count,
+                  };
+                  if (include_explanation) {
+                    const expl = buildProfileExplanation(p.profile);
+                    if (expl) Object.assign(base, expl);
+                  }
+                  return base;
+                }),
                 note:
                   filtered.length === 0
                     ? `Нет профилей с охватом >= ${min_pct}%. Уменьшите min_pct.`
@@ -1094,82 +1131,7 @@ function registerTools(server) {
     }
   );
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ИНСТРУМЕНТ 7: get_approval_level
-  // ═══════════════════════════════════════════════════════════════════════════
 
-  server.tool(
-    "get_approval_level",
-    "Определяет уровень согласования для набора ролей: " +
-    "standard (руководитель), accounting (+главбух), transport (+нач. АТ), transport_accounting (+оба).",
-    {
-      roles: z.array(z.string()).describe("Массив наименований ролей 1С"),
-    },
-    async ({ roles }) => {
-      let requiresAccounting = false;
-      let requiresTransport = false;
-      let requiresProcurement = false;
-      const matchedFunctions = [];
-
-      for (const func of RBAC_MATRIX.business_functions) {
-        if (func.roles.some((r) => roles.includes(r))) {
-          matchedFunctions.push(func.display_name);
-          if (func.requires_chief_accountant) requiresAccounting = true;
-          if (func.requires_transport_head) requiresTransport = true;
-        }
-      }
-
-      // Проверить профили по requires_procurement_director
-      for (const profile of ACCESS_PROFILES) {
-        if (profile.requires_procurement_director && profile.key_roles.some((r) => roles.includes(r))) {
-          requiresProcurement = true;
-        }
-      }
-
-      const level =
-        requiresAccounting && requiresTransport
-          ? "transport_accounting"
-          : requiresAccounting
-          ? "accounting"
-          : requiresTransport
-          ? "transport"
-          : requiresProcurement
-          ? "procurement"
-          : "standard";
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                approval_level: level,
-                requires_chief_accountant: requiresAccounting,
-                requires_transport_head: requiresTransport,
-                requires_procurement_director: requiresProcurement,
-                approvers_required: [
-                  "Линейный руководитель (всегда обязателен)",
-                  ...(requiresAccounting ? ["Главный бухгалтер (есть роли БУ/НУ)"] : []),
-                  ...(requiresTransport ? ["Руководитель отдела АТ (есть транспортные роли)"] : []),
-                  ...(requiresProcurement ? ["Директор по закупкам (есть роли закупок)"] : []),
-                ],
-                matched_business_functions: matchedFunctions,
-                description: {
-                  standard: "Только линейный руководитель",
-                  accounting: "Руководитель + Главный бухгалтер",
-                  transport: "Руководитель + Руководитель АТ",
-                  transport_accounting: "Руководитель + Главный бухгалтер + Руководитель АТ",
-                  procurement: "Руководитель + Директор по закупкам",
-                }[level],
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  );
   // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 10: explain_profile
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1270,62 +1232,32 @@ function registerTools(server) {
       }
       const accessibleSections = allKeywords.slice(0, 6);
 
-      // 6. approval
-      const requiresAccounting = profile.requires_chief_accountant;
-      const requiresTransport = profile.requires_transport_head;
-      const requiresProcurement = profile.requires_procurement_director || false;
-      const approvalLevel =
-        requiresAccounting && requiresTransport
-          ? "transport_accounting"
-          : requiresAccounting
-          ? "accounting"
-          : requiresTransport
-          ? "transport"
-          : requiresProcurement
-          ? "procurement"
-          : "standard";
-      const approvers = ["Линейный руководитель (всегда)"];
-      if (requiresAccounting) approvers.push("Главный бухгалтер");
-      if (requiresTransport) approvers.push("Руководитель отдела АТ");
-      if (requiresProcurement) approvers.push("Директор по закупкам");
-      const approvalNote =
-        approvalLevel === "transport_accounting"
-          ? "Требуется согласование руководителя, главного бухгалтера и руководителя АТ"
-          : approvalLevel === "accounting"
-          ? "Требуется согласование руководителя и главного бухгалтера"
-          : approvalLevel === "transport"
-          ? "Требуется согласование руководителя и руководителя АТ"
-          : approvalLevel === "procurement"
-          ? "Требуется согласование руководителя и директора по закупкам"
-          : "Стандартное согласование — только линейный руководитель";
+      // 6. approval — используем утилиты из rbac_matrix.js
+      const approvalLevel = computeApprovalLevel(profile);
+      const approvers     = formatApprovers(profile);
+      const approvalDesc  = describeApprovalLevel(approvalLevel);
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                profile: {
-                  id: profile.id,
-                  name: profile.name,
-                  description: profile.description,
-                  ...(profile.notes ? { notes: profile.notes } : {}),
-                },
-                can_do: canDo,
-                accessible_sections: accessibleSections,
-                approval: {
-                  level: approvalLevel,
-                  approvers,
-                  note: approvalNote,
-                },
-                key_roles_count: profile.key_roles.length,
-                matched_business_functions: matchedFunctions.map((bf) => bf.display_name),
-              },
-              null,
-              2
-            ),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            profile: {
+              id: profile.id,
+              name: profile.name,
+              description: profile.description,
+              ...(profile.notes ? { notes: profile.notes } : {}),
+            },
+            can_do: canDo,
+            accessible_sections: accessibleSections,
+            approval: {
+              level:    approvalLevel,
+              approvers,
+              note:     approvalDesc,
+            },
+            key_roles_count: profile.key_roles.length,
+            matched_business_functions: matchedFunctions.map((bf) => bf.display_name),
+          }, null, 2),
+        }],
       };
     }
   );
@@ -1859,6 +1791,373 @@ function registerTools(server) {
       };
     }
   );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 20: get_instruction_access_requirements
+  // Идея 2: связка «Инструкция → Профиль доступа»
+  // Отвечает на вопрос: «Какие права нужны, чтобы выполнить действия из инструкции?»
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "get_instruction_access_requirements",
+    "Определяет, какие профили доступа и роли 1С нужны, чтобы выполнять действия, " +
+    "описанные в конкретной инструкции. Помогает понять, почему сотрудник не может " +
+    "выполнить действие из инструкции, и какой доступ для этого запросить. " +
+    "Принимает id инструкции (имя .md-файла) или код (например 'ИП-301').",
+    {
+      instruction_id: z.string().describe(
+        "ID инструкции (имя .md-файла) или код инструкции, например 'ИП-301', 'wiki-kazn-zayavka-rds'"
+      ),
+    },
+    async ({ instruction_id }) => {
+      // 1. Найти инструкцию
+      const doc = getInstruction(instruction_id);
+      if (!doc) {
+        // Попробуем поиск по ключевым словам
+        const searchResult = searchInstructions(instruction_id, { limit: 5 });
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: `Инструкция '${instruction_id}' не найдена.`,
+              hint: "Используйте list_instructions или search_instructions чтобы найти нужную инструкцию.",
+              similar_instructions: searchResult.results.map((r) => ({
+                id: r.id,
+                code: r.code,
+                title: r.title,
+                topic: r.topic,
+              })),
+            }, null, 2),
+          }],
+        };
+      }
+
+      // 2. Определяем тематический раздел и ключевые слова из инструкции
+      const contentLower = (doc.content || "").toLowerCase();
+      const titleLower   = (doc.title   || "").toLowerCase();
+      const topicLower   = (doc.topic   || "").toLowerCase();
+
+      // ── Маппинг topic → id бизнес-функций (повышает точность) ────────────
+      const TOPIC_BF_MAP = {
+        "казначейство":         ["FINANCE_TREASURY_EXECUTOR", "FINANCE_BUDGET_EXECUTOR"],
+        "транспорт и гсм":      ["TRANSPORT_DISPATCHER", "TRANSPORT_MECHANIC"],
+        "склад и снабжение":    ["WAREHOUSE_OPERATOR", "CONTRACTS_EXECUTOR"],
+        "бюджетирование":       ["FINANCE_BUDGET_EXECUTOR"],
+        "бухгалтерия":          ["ACCOUNTING_BU_NU"],
+        "закупки и договоры":   ["CONTRACTS_EXECUTOR"],
+        "номенклатура и нси":   [],
+        "эдо":                  [],
+        "доступ и роли":        [],
+      };
+
+      // Если у инструкции есть раздел — сразу получаем target-функции
+      const topicKey = topicLower.trim();
+      const topicBfIds = new Set(
+        Object.entries(TOPIC_BF_MAP).find(([k]) => topicKey.includes(k))?.[1] || []
+      );
+
+      // 3. Ищем подходящие бизнес-функции
+      //    Приоритет: совпадение по topic-маппингу (+2 хита), затем по keyword-пересечению
+      const matchedFunctions = [];
+      for (const bf of RBAC_MATRIX.business_functions) {
+        let hits = bf.keywords.filter((kw) =>
+          contentLower.includes(kw.toLowerCase()) || titleLower.includes(kw.toLowerCase())
+        ).length;
+        if (topicBfIds.has(bf.id)) hits += 2; // бонус за совпадение по topic
+        if (hits > 0) {
+          matchedFunctions.push({ bf, hits });
+        }
+      }
+      matchedFunctions.sort((a, b) => b.hits - a.hits);
+
+      // 4. Ищем подходящие профили доступа
+      const matchedProfiles = [];
+      for (const profile of ACCESS_PROFILES) {
+        const profileKeywords = profile.keywords || [];
+        const nameLower = (profile.name || "").toLowerCase();
+
+        let hits =
+          profileKeywords.filter((kw) =>
+            contentLower.includes(kw.toLowerCase()) ||
+            titleLower.includes(kw.toLowerCase()) ||
+            topicLower.includes(kw.toLowerCase())
+          ).length;
+
+        // Бонус за совпадение профиля с найденными бизнес-функциями через key_roles
+        const topBfRoles = new Set(
+          matchedFunctions.slice(0, 3).flatMap((m) => m.bf.roles.map((r) => r.toLowerCase()))
+        );
+        const profileRolesMatched = (profile.key_roles || []).filter((r) =>
+          topBfRoles.has(r.toLowerCase())
+        ).length;
+        hits += profileRolesMatched;
+
+        // Бонус за topic в названии профиля
+        if (topicLower && nameLower.includes(topicLower.split(/\s+/)[0])) hits += 1;
+
+        if (hits > 0) {
+          matchedProfiles.push({ profile, hits });
+        }
+      }
+      matchedProfiles.sort((a, b) => b.hits - a.hits);
+
+      // 5. Определяем уровень согласования через утилиты
+      const reqFlags = {
+        requires_chief_accountant: matchedFunctions.some((m) => m.bf.requires_chief_accountant),
+        requires_transport_head:   matchedFunctions.some((m) => m.bf.requires_transport_head),
+      };
+      const approvalLevel = computeApprovalLevel(reqFlags);
+      const approvers     = formatApprovers(reqFlags);
+
+      // 6. Формируем объяснение «почему недоступно»
+      const topProfiles = matchedProfiles.slice(0, 5).map((m) => ({
+        id: m.profile.id,
+        name: m.profile.name,
+        description: m.profile.description,
+        relevance_hits: m.hits,
+        requires_chief_accountant: m.profile.requires_chief_accountant,
+        requires_transport_head: m.profile.requires_transport_head,
+      }));
+
+      const topFunctions = matchedFunctions.slice(0, 3).map((m) => ({
+        id: m.bf.id,
+        display_name: m.bf.display_name,
+        description: m.bf.description,
+        relevance_hits: m.hits,
+        key_roles: m.bf.roles.slice(0, 4),
+      }));
+
+      const hasMatches = topProfiles.length > 0 || topFunctions.length > 0;
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            instruction: {
+              id: doc.id,
+              code: doc.code,
+              title: doc.title,
+              topic: doc.topic,
+              source: doc.source,
+            },
+            access_requirements: {
+              summary: hasMatches
+                ? `Для выполнения действий из инструкции '${doc.title}' необходимы следующие профили доступа.`
+                : `Не удалось автоматически определить требуемые профили. Используйте suggest_access_profile для подбора.`,
+              topic_matched: topicBfIds.size > 0 ? [...topicBfIds] : null,
+              approval_level:       approvalLevel,
+              approval_description: describeApprovalLevel(approvalLevel),
+              approvers_required:   approvers,
+              required_profiles:    topProfiles,
+              related_business_functions: topFunctions,
+              if_access_denied_hint:
+                "Если сотрудник не может выполнить описанные действия — " +
+                "скорее всего, ему не назначены указанные профили доступа. " +
+                "Используйте get_user_access_journey для проверки полной цепочки прав.",
+            },
+            mandatory_roles: RBAC_MATRIX.mandatory_roles.roles,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 22: get_user_access_journey
+  // Идея 3: Полная цепочка «Путь пользователя»
+  // Должность → Типовые профили → Бизнес-функции → Роли → Согласование
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "get_user_access_journey",
+    "Строит полную цепочку доступа для сотрудника по его должности: " +
+    "Должность → Типовые профили (из реальных данных) → Бизнес-функции → " +
+    "Конкретные роли 1С → Уровень согласования → Инструкции для работы. " +
+    "Даёт HR-менеджеру и руководителю полное понимание того, что получит сотрудник в 1С.",
+    {
+      job_title: z.string().describe(
+        "Должность сотрудника. Например: 'кладовщик', 'диспетчер АТО', 'бухгалтер', 'механик'"
+      ),
+      min_pct: z.number().min(0).max(100).default(40).describe(
+        "Минимальный % охвата для включения профиля (по умолчанию 40%)"
+      ),
+      include_roles: z.boolean().default(false).describe(
+        "Включать ли полный список ролей 1С в ответ (по умолчанию false — только маркерные)"
+      ),
+    },
+    async ({ job_title, min_pct, include_roles }) => {
+
+      // ── Шаг 1: Найти должность в базе ─────────────────────────────────────
+      let exactData = getJobProfiles(job_title);
+      let matchedJob = exactData ? job_title : null;
+
+      if (!exactData) {
+        const result = suggestByJobQuery(job_title);
+        if (result) {
+          matchedJob = result.job;
+          exactData = result.data;
+        }
+      }
+
+      if (!exactData) {
+        const similar = findJobs(job_title).slice(0, 8);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: `Должность '${job_title}' не найдена в базе данных.`,
+              hint: "Уточните название должности или используйте list_jobs для поиска.",
+              similar_jobs: similar,
+            }, null, 2),
+          }],
+        };
+      }
+
+      // ── Шаг 2: Проверка качества данных + фильтрация профилей ─────────────
+      const journeyAnomaly = checkJobAnomaly(matchedJob, exactData);
+      const typicalProfiles = (exactData.typical_profiles || [])
+        .filter((p) => p.pct >= min_pct)
+        .slice(0, 8);
+
+      // ── Шаг 3: Разворачиваем каждый профиль → бизнес-функции → роли ───────
+      const journeySteps = typicalProfiles.map((tp) => {
+        // Ищем профиль в ACCESS_PROFILES
+        const profile = ACCESS_PROFILES.find(
+          (p) => p.name === tp.profile || p.id === tp.profile
+        );
+        if (!profile) {
+          return {
+            profile_name: tp.profile,
+            coverage_pct: tp.pct,
+            persons_count: tp.count,
+            warning: "Профиль не найден в матрице ACCESS_PROFILES",
+          };
+        }
+
+        // Находим бизнес-функции
+        const profileRolesSet = new Set((profile.key_roles || []).map((r) => r.toLowerCase()));
+        const matchedFunctions = RBAC_MATRIX.business_functions.filter((bf) =>
+          bf.roles.some((r) => profileRolesSet.has(r.toLowerCase()))
+        );
+
+        // Что сможет делать сотрудник
+        const canDo = matchedFunctions.map((bf) => bf.description).filter(Boolean);
+        if (canDo.length === 0 && profile.description) {
+          canDo.push(profile.description);
+        }
+
+        // Уровень согласования
+        const reqAccounting = profile.requires_chief_accountant;
+        const reqTransport = profile.requires_transport_head;
+        const reqProcurement = profile.requires_procurement_director || false;
+        const approvalLevel =
+          reqAccounting && reqTransport
+            ? "transport_accounting"
+            : reqAccounting
+            ? "accounting"
+            : reqTransport
+            ? "transport"
+            : reqProcurement
+            ? "procurement"
+            : "standard";
+        const approvers = ["Линейный руководитель"];
+        if (reqAccounting) approvers.push("Главный бухгалтер");
+        if (reqTransport) approvers.push("Руководитель АТ");
+        if (reqProcurement) approvers.push("Директор по закупкам");
+
+        const step = {
+          profile_id: profile.id,
+          profile_name: profile.name,
+          coverage_pct: tp.pct,
+          persons_count: tp.count,
+          what_employee_can_do: canDo,
+          related_business_functions: matchedFunctions.map((bf) => ({
+            id: bf.id,
+            display_name: bf.display_name,
+          })),
+          approval_level: approvalLevel,
+          approvers_required: approvers,
+        };
+
+        if (include_roles) {
+          step.key_roles = profile.key_roles || [];
+        }
+
+        return step;
+      });
+
+      // ── Шаг 4: Поиск релевантных инструкций по должности ──────────────────
+      const instructionSearch = searchInstructions(matchedJob, { limit: 5 });
+      const relatedInstructions = instructionSearch.results.map((r) => ({
+        id: r.id,
+        code: r.code,
+        title: r.title,
+        topic: r.topic,
+      }));
+
+      // ── Шаг 5: Итоговый уровень согласования по всем профилям ─────────────
+      const overallLevel = computeApprovalLevelMany(journeySteps.map((s) => ({
+        requires_chief_accountant: s.approval_level === "accounting" || s.approval_level === "transport_accounting",
+        requires_transport_head:   s.approval_level === "transport"  || s.approval_level === "transport_accounting",
+        requires_procurement_director: s.approval_level === "procurement",
+      })));
+      const overallApprovers = formatApprovers({
+        requires_chief_accountant:    overallLevel === "accounting" || overallLevel === "transport_accounting",
+        requires_transport_head:      overallLevel === "transport"  || overallLevel === "transport_accounting",
+        requires_procurement_director: overallLevel === "procurement",
+      });
+
+      // ── Шаг 6: Что видит сотрудник в 1С (агрегированно) ───────────────────
+      const allCanDo = [...new Set(journeySteps.flatMap((s) => s.what_employee_can_do || []))];
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            journey_for: matchedJob,
+            total_persons_in_db: exactData.total_persons,
+            min_pct_filter: min_pct,
+            profiles_count: journeySteps.length,
+
+            // Качество данных
+            data_quality: journeyAnomaly.is_anomaly
+              ? {
+                  is_anomaly: true,
+                  reason: journeyAnomaly.reason,
+                  warning: journeyAnomaly.reason === "all_profiles_100pct"
+                    ? "Данные нерепрезентативны: все профили имеют 100% охват — вероятно тестовые учётные записи. " +
+                      "Рекомендации могут не отражать реальный набор прав."
+                    : `Малая выборка: только ${exactData.total_persons} чел. Статистика может быть недостоверной.`,
+                }
+              : { is_anomaly: false },
+
+            // Агрегированная сводка
+            summary: {
+              what_employee_will_see_in_1c: allCanDo,
+              overall_approval_level: overallLevel,
+              overall_approval_description: describeApprovalLevel(overallLevel),
+              overall_approvers: overallApprovers,
+              mandatory_roles: RBAC_MATRIX.mandatory_roles.roles,
+            },
+
+            // Пошаговая цепочка
+            access_chain: journeySteps,
+
+            // Релевантные инструкции
+            relevant_instructions: relatedInstructions.length > 0
+              ? relatedInstructions
+              : null,
+
+            usage_hint:
+              "Используйте suggest_access_profile(generate_request_text=true) для формирования заявки на доступ. " +
+              "Используйте get_instruction_access_requirements чтобы проверить доступ к конкретной инструкции.",
+          }, null, 2),
+        }],
+      };
+    }
+  );
 }
 
 // ── HTTP-сервер ───────────────────────────────────────────────────────────────
@@ -1893,7 +2192,7 @@ async function reloadKnowledgeBase(reason = "manual") {
   const start = Date.now();
   try {
     const docs = loadKnowledgeBase();   // из knowledge_base.js, возвращает полные объекты с tokens
-    // Пересчитываем TF-IDF индекс после загрузки
+    // Пересчитываем TF-IDF индекс после загрузки (buildTfidfIndex также сбрасывает searchCache)
     buildTfidfIndex(docs);
     lastReloadAt = new Date().toISOString();
     const elapsed = Date.now() - start;
@@ -1955,25 +2254,28 @@ app.get("/health", async (req, res) => {
   res.json({
     status: "ok",
     server: "gti-1c-mcp",
-    version: "2.0.0",
+    version: "3.0.0",
+    tools_count: 19,
     tools: [
-      // База знаний
-      "list_instructions",
-      "search_instructions",
+      // База знаний (объединено: было 5 → стало 3)
+      "list_instructions",          // фильтры: code, keyword, topic, list_topics
+      "search_instructions",        // mode: auto | semantic | keyword
       "get_instruction",
-      "semantic_search_instructions",
-      // Профили доступа RBAC
-      "suggest_access_profile",
+      // Профили доступа RBAC (объединено: было 6 → стало 6)
+      "suggest_access_profile",     // + generate_request_text
       "get_roles_matrix",
-      "validate_roles",
-      "get_approval_level",
+      "analyze_roles",              // объединяет validate_roles + get_approval_level
       "explain_profile",
       "search_by_role",
+      "get_profiles_by_function",
       // Маппинг должность → профили
-      "suggest_profile_by_job",
+      "suggest_profile_by_job",     // + include_explanation
       "list_jobs",
+      // Связка инструкция ↔ доступ
+      "get_instruction_access_requirements",  // + topic-маппинг
+      "get_user_access_journey",              // + data_quality
       // Живая база 1С
-      "onec_health",
+      "onec_health",               // кэш 60 сек
       "list_1c_users",
       "get_1c_access_groups",
       "execute_1c_query",
@@ -1988,6 +2290,7 @@ app.get("/health", async (req, res) => {
       last_reload: lastReloadAt,
     },
     tfidf_index: getIndexStats(),
+    search_cache: getSearchCacheStats(),
     embedding_index: getEmbeddingStats(),
     job_profiles: {
       loaded: true,
@@ -1999,6 +2302,7 @@ app.get("/health", async (req, res) => {
       url: getOnecConfig().url || null,
       status: onecHealth.ok ? "ok" : "unavailable",
       detail: onecHealth.detail,
+      cached: onecHealth.cached || false,
     },
     timestamp: new Date().toISOString(),
   });
@@ -2015,10 +2319,11 @@ app.get("/", (req, res) => {
     auth_header: "X-MCP-Token: <token>",
     docs: "Добавьте в клиент MCP: Remote → URL: http://localhost:3031/mcp, Header: X-MCP-Token: <token>",
     tool_groups: {
-      knowledge_base: ["list_instructions", "search_instructions", "get_instruction", "semantic_search_instructions"],
-      rbac_profiles: ["suggest_access_profile", "get_roles_matrix", "validate_roles", "get_approval_level", "explain_profile", "search_by_role"],
-      job_mapping: ["suggest_profile_by_job", "list_jobs"],
-      live_1c: ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents"],
+      knowledge_base:  ["list_instructions", "search_instructions", "get_instruction"],
+      rbac_profiles:   ["suggest_access_profile", "get_roles_matrix", "analyze_roles", "explain_profile", "search_by_role", "get_profiles_by_function"],
+      job_mapping:     ["suggest_profile_by_job", "list_jobs"],
+      access_journey:  ["get_instruction_access_requirements", "get_user_access_journey"],
+      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents"],
     },
     onec_integration: {
       configured: onecCfg.configured,

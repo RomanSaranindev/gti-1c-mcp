@@ -158,13 +158,30 @@ export async function callOnecTool(toolName, args = {}) {
   return onecRpc("tools/call", { name: toolName, arguments: args });
 }
 
+// ── Кэш health-check (TTL 60 сек, сбрасывается при ошибке) ──────────────────
+
+const HEALTH_CACHE_TTL = 60_000; // мс
+let _healthCache = null; // { result: {ok, detail}, at: timestamp }
+
+/** Принудительно сбрасывает кэш health (например после изменения конфигурации). */
+export function clearHealthCache() {
+  _healthCache = null;
+}
+
 /**
  * Проверяет соединение с 1С (GET /health эндпоинт расширения).
- * @returns {Promise<{ ok: boolean, detail?: string }>}
+ * Результат кэшируется на 60 секунд; при ошибке кэш сбрасывается немедленно.
+ * @param {{ force?: boolean }} [options] — force=true игнорирует кэш
+ * @returns {Promise<{ ok: boolean, detail?: string, cached?: boolean }>}
  */
-export async function checkOnecHealth() {
+export async function checkOnecHealth({ force = false } = {}) {
   if (!isOnecConfigured()) {
     return { ok: false, detail: "Не настроено (нет ONEC_URL или ONEC_USERNAME)" };
+  }
+
+  // Отдаём кэш если актуален
+  if (!force && _healthCache && (Date.now() - _healthCache.at) < HEALTH_CACHE_TTL) {
+    return { ..._healthCache.result, cached: true };
   }
 
   const healthUrl = `${ONEC_URL}/hs/${ONEC_SERVICE_ROOT}/health`;
@@ -172,6 +189,7 @@ export async function checkOnecHealth() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
 
+  let result;
   try {
     const response = await fetch(healthUrl, {
       headers: { "Authorization": `Basic ${credentials}` },
@@ -180,13 +198,24 @@ export async function checkOnecHealth() {
     clearTimeout(timer);
     if (response.ok) {
       const json = await response.json().catch(() => ({}));
-      return { ok: true, detail: json.status || "ok" };
+      result = { ok: true, detail: json.status || "ok" };
+    } else {
+      result = { ok: false, detail: `HTTP ${response.status}` };
     }
-    return { ok: false, detail: `HTTP ${response.status}` };
   } catch (err) {
     clearTimeout(timer);
-    return { ok: false, detail: err.name === "AbortError" ? "timeout" : err.message };
+    result = { ok: false, detail: err.name === "AbortError" ? "timeout" : err.message };
   }
+
+  if (result.ok) {
+    // Кэшируем только успешный результат
+    _healthCache = { result, at: Date.now() };
+  } else {
+    // При ошибке — сбрасываем кэш чтобы следующий вызов снова делал запрос
+    _healthCache = null;
+  }
+
+  return result;
 }
 
 // ── Специализированные методы ─────────────────────────────────────────────────
