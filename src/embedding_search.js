@@ -43,7 +43,7 @@ export async function buildEmbeddingIndex(docs) {
   initInProgress = true;
 
   try {
-    console.log("🔄 [embedding_search] Загружаю модель multilingual-e5-small...");
+    process.stderr.write("🔄 [embedding_search] Загружаю модель multilingual-e5-small...\n");
 
     // Динамический импорт — @xenova/transformers — не блокирует старт сервера
     const { pipeline, env } = await import("@xenova/transformers");
@@ -59,7 +59,7 @@ export async function buildEmbeddingIndex(docs) {
       { quantized: true } // ONNX quantized — меньше памяти
     );
 
-    console.log("✅ [embedding_search] Модель загружена. Вычисляю эмбеддинги...");
+    process.stderr.write("✅ [embedding_search] Модель загружена. Вычисляю эмбеддинги...\n");
 
     const docEmbeddingsMap = new Map();
     const docsMap = new Map();
@@ -87,7 +87,7 @@ export async function buildEmbeddingIndex(docs) {
         docsMap.set(doc.id, doc);
       }
 
-      console.log(`  [embedding_search] ${Math.min(i + BATCH_SIZE, docs.length)}/${docs.length} документов обработано`);
+      process.stderr.write(`  [embedding_search] ${Math.min(i + BATCH_SIZE, docs.length)}/${docs.length} документов обработано\n`);
     }
 
     embeddingIndex = {
@@ -100,14 +100,14 @@ export async function buildEmbeddingIndex(docs) {
 
     isReady = true;
     initError = null;
-    console.log(`✅ [embedding_search] Индекс построен: ${docs.length} документов, dim=${embeddingIndex.dim}`);
+    process.stderr.write(`✅ [embedding_search] Индекс построен: ${docs.length} документов, dim=${embeddingIndex.dim}\n`);
 
     return { is_ready: true, docs_count: docs.length };
   } catch (err) {
     isReady = false;
     initError = err.message;
-    console.warn(`⚠️  [embedding_search] Не удалось загрузить модель: ${err.message}`);
-    console.warn("    Semantic search будет использовать TF-IDF fallback.");
+    process.stderr.write(`⚠️  [embedding_search] Не удалось загрузить модель: ${err.message}\n`);
+    process.stderr.write("    Semantic search будет использовать TF-IDF fallback.\n");
     return { is_ready: false, docs_count: 0, error: err.message };
   } finally {
     initInProgress = false;
@@ -186,7 +186,7 @@ export async function embeddingSearch(query, { limit = 5, minScore = 0.3 } = {})
       results: scored.slice(0, limit),
     };
   } catch (err) {
-    console.error(`❌ [embedding_search] Ошибка при поиске: ${err.message}`);
+    process.stderr.write(`❌ [embedding_search] Ошибка при поиске: ${err.message}\n`);
     return null; // Fallback на TF-IDF
   }
 }

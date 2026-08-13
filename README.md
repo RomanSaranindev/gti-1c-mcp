@@ -114,55 +114,157 @@ MCP-сервер (Model Context Protocol) для **1С:БИТ / БИТ.СТРО�
 
 ---
 
-## Установка на новом рабочем месте
+## Установка и подключение
 
-### Требования
+Сервер поддерживает два режима работы:
 
-- Node.js 18+ ([скачать](https://nodejs.org/))
-- Git
-- (опционально) Docker + Docker Compose
+| Режим | Транспорт | Когда использовать |
+|---|---|---|
+| **stdio** (рекомендуется) | stdin/stdout | Локально в IDE — IDE сама запускает и останавливает процесс |
+| **HTTP** | HTTP/SSE | Корпоративный сервер — один экземпляр для всей команды |
 
 ---
 
-### Вариант 1 — локальный запуск (Node.js)
+## Режим stdio — запуск через IDE (рекомендуется)
 
-#### Шаг 1. Клонировать репозиторий
+### Требования
+
+- **Node.js 18+** — [скачать](https://nodejs.org/)
+
+Больше ничего не нужно. IDE сама запускает сервер при открытии и останавливает при закрытии. Никаких daemon-процессов, открытых портов и ручных перезапусков.
+
+---
+
+### OpenCode
+
+Добавить в `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "gti-1c": {
+      "type": "local",
+      "command": ["npx", "-y", "gti-1c-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Готово. После сохранения файла перезапустите OpenCode.
+
+---
+
+### Claude Desktop
+
+Файл конфигурации: `%APPDATA%\Claude\claude_desktop_config.json` (Windows) или `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
+
+```json
+{
+  "mcpServers": {
+    "gti-1c": {
+      "command": "npx",
+      "args": ["-y", "gti-1c-mcp"]
+    }
+  }
+}
+```
+
+---
+
+### Cursor
+
+Файл `.cursor/mcp.json` в корне проекта или `~/.cursor/mcp.json` глобально:
+
+```json
+{
+  "mcpServers": {
+    "gti-1c": {
+      "command": "npx",
+      "args": ["-y", "gti-1c-mcp"]
+    }
+  }
+}
+```
+
+---
+
+### Continue.dev
+
+В файле `~/.continue/config.json`:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "gti-1c",
+      "command": "npx",
+      "args": ["-y", "gti-1c-mcp"]
+    }
+  ]
+}
+```
+
+---
+
+### Передача переменных окружения (1С-подключение)
+
+Если нужно подключить живую базу 1С, передайте переменные через `env`:
+
+**OpenCode:**
+```json
+{
+  "mcp": {
+    "gti-1c": {
+      "type": "local",
+      "command": ["npx", "-y", "gti-1c-mcp"],
+      "enabled": true,
+      "environment": {
+        "ONEC_URL": "http://ваш-сервер/база",
+        "ONEC_USERNAME": "технический_пользователь",
+        "ONEC_PASSWORD": "пароль"
+      }
+    }
+  }
+}
+```
+
+**Claude Desktop / Cursor:**
+```json
+{
+  "mcpServers": {
+    "gti-1c": {
+      "command": "npx",
+      "args": ["-y", "gti-1c-mcp"],
+      "env": {
+        "ONEC_URL": "http://ваш-сервер/база",
+        "ONEC_USERNAME": "технический_пользователь",
+        "ONEC_PASSWORD": "пароль"
+      }
+    }
+  }
+}
+```
+
+---
+
+## Режим HTTP — корпоративный сервер
+
+Используйте если один экземпляр сервера обслуживает несколько пользователей.
+
+### Требования
+
+- Node.js 18+ или Docker
+- Git
+
+### Вариант A — локальный запуск (Node.js)
 
 ```bash
-# С GitHub:
 git clone https://github.com/RomanSaranindev/gti-1c-mcp.git
-
-# Или с GitLab (внутренний):
-git clone https://gitlab.ide-spb.com/saraninrg/gti-1c-mcp.git
-
 cd gti-1c-mcp
-```
-
-#### Шаг 2. Установить зависимости
-
-```bash
 npm install
-```
-
-#### Шаг 3. Настроить окружение
-
-```bash
-# Скопировать шаблон
 cp .env.example .env
-```
-
-Открыть `.env` и задать токен:
-
-```env
-MCP_PORT=3031
-MCP_API_TOKEN=ВАШ_СЕКРЕТНЫЙ_ТОКЕН
-```
-
-> Токен по умолчанию `gti-mcp-token-2024` — обязательно смените перед деплоем.
-
-#### Шаг 4. Запустить сервер
-
-```bash
+# Отредактировать .env — задать MCP_API_TOKEN
 npm start
 ```
 
@@ -172,107 +274,19 @@ npm start
 curl http://localhost:3031/health
 ```
 
----
-
-### Вариант 2 — Docker
+### Вариант B — Docker
 
 ```bash
 git clone https://github.com/RomanSaranindev/gti-1c-mcp.git
 cd gti-1c-mcp
-
 cp .env.example .env
 # Отредактировать .env — задать MCP_API_TOKEN
-
 docker-compose up -d
 ```
 
-Проверить:
+### Подключение клиентов к HTTP-серверу
 
-```bash
-curl http://localhost:3031/health
-```
-
----
-
-### Вариант 3 — автозапуск на Windows (Task Scheduler)
-
-Чтобы сервер стартовал при загрузке Windows без ручного запуска:
-
-1. Открыть **Планировщик заданий** (`taskschd.msc`)
-2. Действие → Создать задачу
-3. Вкладка **Общие**: имя `gti-1c-mcp`, выполнять для всех пользователей
-4. Вкладка **Триггеры**: При запуске системы
-5. Вкладка **Действия** → Создать:
-   - Программа: `node`
-   - Аргументы: `src/server.js`
-   - Рабочая папка: полный путь к папке проекта (например `C:\projects\gti-1c-mcp`)
-6. Вкладка **Условия**: снять галку "Только при питании от сети"
-7. ОК → ввести пароль пользователя Windows
-
-Или через PowerShell (запустить от администратора):
-
-```powershell
-$action = New-ScheduledTaskAction `
-    -Execute "node" `
-    -Argument "src/server.js" `
-    -WorkingDirectory "C:\projects\gti-1c-mcp"
-
-$trigger = New-ScheduledTaskTrigger -AtStartup
-
-Register-ScheduledTask `
-    -TaskName "gti-1c-mcp" `
-    -Action $action `
-    -Trigger $trigger `
-    -RunLevel Highest `
-    -Force
-```
-
----
-
-## Подключение к MCP-клиенту
-
-### OpenCode / Kilo Code
-
-Добавить в `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "mcp": {
-    "gti-1c": {
-      "type": "remote",
-      "url": "http://localhost:3031/mcp",
-      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" },
-      "enabled": true
-    }
-  }
-}
-```
-
-После сохранения — перезапустить opencode.
-
----
-
-### Claude Desktop
-
-В файл конфигурации Claude Desktop:
-
-```json
-{
-  "mcpServers": {
-    "gti-1c": {
-      "url": "http://localhost:3031/mcp",
-      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" }
-    }
-  }
-}
-```
-
----
-
-### Если сервер на другой машине в сети
-
-Замените `localhost` на IP или hostname сервера:
-
+**OpenCode:**
 ```json
 {
   "mcp": {
@@ -286,10 +300,21 @@ Register-ScheduledTask `
 }
 ```
 
-Убедитесь, что порт `3031` открыт в брандмауэре сервера:
+**Claude Desktop / Cursor:**
+```json
+{
+  "mcpServers": {
+    "gti-1c": {
+      "url": "http://192.168.1.100:3031/mcp",
+      "headers": { "X-MCP-Token": "ВАШ_ТОКЕН" }
+    }
+  }
+}
+```
+
+Открыть порт в брандмауэре (если сервер удалённый):
 
 ```powershell
-# На сервере (PowerShell, от администратора):
 New-NetFirewallRule -DisplayName "gti-1c-mcp" -Direction Inbound -Protocol TCP -LocalPort 3031 -Action Allow
 ```
 

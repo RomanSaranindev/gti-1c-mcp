@@ -4,6 +4,14 @@
   "description": "MCP-сервер: база знаний инструкций 1С.БИТ и подбор профилей доступа RBAC",
   "type": "module",
   "main": "src/server.js",
+  "bin": {
+    "gti-1c-mcp": "src/server.js"
+  },
+  "files": [
+    "src/",
+    "knowledge/",
+    ".env.example"
+  ],
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"

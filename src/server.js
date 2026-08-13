@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * gti-1c-mcp — MCP-сервер
  *
@@ -42,6 +43,11 @@
  *  23. compare_routes                 — сравнение маршрутов двух организаций
  *  24. validate_route_params          — валидация параметров перед подбором маршрута
  */
+
+// Разрешить самоподписанные SSL-сертификаты (корпоративный IIS)
+if (process.env.ONEC_URL && process.env.ONEC_URL.startsWith("https")) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -121,8 +127,17 @@ import {
 const PORT = parseInt(process.env.PORT || process.env.MCP_PORT || "3031");
 const API_TOKEN = process.env.MCP_API_TOKEN || "gti-mcp-token-2024";
 
+/**
+ * Безопасный вывод лога: всегда в stderr.
+ * В stdio-режиме stdout занят MCP-протоколом — любой вывод в stdout его сломает.
+ * В HTTP-режиме stderr и stdout эквивалентны, но единообразие лучше.
+ */
+function log(...args) {
+  process.stderr.write(args.join(" ") + "\n");
+}
+
 if (!process.env.MCP_API_TOKEN) {
-  console.warn(
+  log(
     "⚠️  MCP_API_TOKEN не задан — используется токен по умолчанию. " +
     "Смените переменную окружения перед публичным деплоем!"
   );
@@ -2396,7 +2411,7 @@ let lastReloadAt = null;
 
 async function reloadKnowledgeBase(reason = "manual") {
   if (reloadInProgress) {
-    console.log(`⏳ Перезагрузка уже выполняется, пропуск (${reason})`);
+    log(`⏳ Перезагрузка уже выполняется, пропуск (${reason})`);
     return { skipped: true, reason: "already_in_progress" };
   }
   reloadInProgress = true;
@@ -2408,12 +2423,12 @@ async function reloadKnowledgeBase(reason = "manual") {
     lastReloadAt = new Date().toISOString();
     const elapsed = Date.now() - start;
     const idxStats = getIndexStats();
-    console.log(`✅ База знаний перезагружена (${reason}): ${docs.length} инструкций, vocab=${idxStats.vocab_size} за ${elapsed}ms`);
+    log(`✅ База знаний перезагружена (${reason}): ${docs.length} инструкций, vocab=${idxStats.vocab_size} за ${elapsed}ms`);
 
     // Обновляем embedding-индекс в фоне (не блокируем перезагрузку)
     buildEmbeddingIndex(docs).then((embResult) => {
       if (embResult.is_ready) {
-        console.log(`🧠 Embedding-индекс обновлён: ${embResult.docs_count} документов`);
+        log(`🧠 Embedding-индекс обновлён: ${embResult.docs_count} документов`);
       }
     }).catch(() => {}); // Ошибки уже логируются внутри buildEmbeddingIndex
 
@@ -2422,7 +2437,7 @@ async function reloadKnowledgeBase(reason = "manual") {
 
     return { success: true, docs_count: docs.length, elapsed_ms: elapsed, reloaded_at: lastReloadAt, index: idxStats };
   } catch (err) {
-    console.error("❌ Ошибка перезагрузки базы знаний:", err.message);
+    log("❌ Ошибка перезагрузки базы знаний:", err.message);
     return { success: false, error: err.message };
   } finally {
     reloadInProgress = false;
@@ -2437,13 +2452,13 @@ try {
     // Debounce: ждём 500ms после последнего события
     clearTimeout(watchDebounceTimer);
     watchDebounceTimer = setTimeout(() => {
-      console.log(`📁 Изменён файл: ${filename} (${eventType}) — перезагружаю базу знаний...`);
+      log(`📁 Изменён файл: ${filename} (${eventType}) — перезагружаю базу знаний...`);
       reloadKnowledgeBase(`fs.watch:${filename}`);
     }, 500);
   });
-  console.log(`👁  Слежу за изменениями в ${KNOWLEDGE_DIR}`);
+  log(`👁  Слежу за изменениями в ${KNOWLEDGE_DIR}`);
 } catch (err) {
-  console.warn(`⚠️  fs.watch не удалось запустить: ${err.message}`);
+  log(`⚠️  fs.watch не удалось запустить: ${err.message}`);
 }
 
 // Горячая перезагрузка базы знаний
@@ -2598,7 +2613,7 @@ app.all("/mcp", async (req, res) => {
 
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error("MCP handler error:", err);
+    log("MCP handler error:", err.message || String(err));
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -2621,7 +2636,7 @@ function initTfidf() {
     const stats = getIndexStats();
     return stats;
   } catch (err) {
-    console.warn(`⚠️  TF-IDF индекс не построен: ${err.message}`);
+    log(`⚠️  TF-IDF индекс не построен: ${err.message}`);
     return null;
   }
 }
@@ -2651,13 +2666,13 @@ if (!process.stdin.isTTY) {
 } else {
   // ── Режим HTTP (для ручного запуска, Docker, remote-подключений) ────────────
   app.listen(PORT, () => {
-    console.log(`✅ gti-1c-mcp запущен на порту ${PORT}`);
-    console.log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
-    console.log(`   Health-check : http://localhost:${PORT}/health`);
-    console.log(`   Профилей     : ${ACCESS_PROFILES.length}`);
-    console.log(`   Инструкций   : ${listInstructions().length}`);
-    console.log(`   API Token    : ${API_TOKEN}`);
+    log(`✅ gti-1c-mcp запущен на порту ${PORT}`);
+    log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
+    log(`   Health-check : http://localhost:${PORT}/health`);
+    log(`   Профилей     : ${ACCESS_PROFILES.length}`);
+    log(`   Инструкций   : ${listInstructions().length}`);
+    log(`   API Token    : ${API_TOKEN}`);
     const stats = initTfidf();
-    if (stats) console.log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
+    if (stats) log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
   });
 }

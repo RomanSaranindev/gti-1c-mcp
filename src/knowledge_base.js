@@ -118,7 +118,7 @@ export function getInstructionsByTopic(topic) {
 export function loadKnowledgeBase() {
   const docs = [];
   if (!fs.existsSync(KNOWLEDGE_DIR)) {
-    console.warn(`Knowledge base directory not found: ${KNOWLEDGE_DIR}`);
+    process.stderr.write(`⚠️  Knowledge base directory not found: ${KNOWLEDGE_DIR}\n`);
     INSTRUCTION_DOCS = [];
     return INSTRUCTION_DOCS;
   }
@@ -131,7 +131,7 @@ export function loadKnowledgeBase() {
     try {
       content = fs.readFileSync(full, "utf-8");
     } catch (e) {
-      console.warn(`Cannot read ${full}: ${e.message}`);
+      process.stderr.write(`⚠️  Cannot read ${full}: ${e.message}\n`);
       continue;
     }
     const header = parseHeader(content);
