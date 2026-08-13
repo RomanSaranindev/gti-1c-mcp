@@ -34,6 +34,13 @@
  *  17. execute_1c_query               — произвольный запрос к данным 1С
  *  18. get_1c_metadata                — метаданные конфигурации 1С
  *  19. get_1c_documents               — документы БИТ.ФИНАНС с фильтрацией
+ *
+ * Маршруты согласования (knowledge/routes/routes_db.json):
+ *  20. list_routes                    — список доступных маршрутов по организациям
+ *  21. suggest_route                  — подбор цепочки согласования по параметрам (БЕ, тип, сумма, ЦФО и др.)
+ *  22. get_route                      — полный маршрут организации (все варианты/шаги/условия)
+ *  23. compare_routes                 — сравнение маршрутов двух организаций
+ *  24. validate_route_params          — валидация параметров перед подбором маршрута
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -99,6 +106,15 @@ import {
   listOnecTools,
   formatOnecError,
 } from "./onec_client.js";
+
+import {
+  reloadDb as reloadRoutesDb,
+  suggestRoute,
+  getRoute,
+  compareRoutes,
+  listRoutes,
+  validateRouteParams,
+} from "./routes_engine.js";
 
 // ── Конфигурация ──────────────────────────────────────────────────────────────
 
@@ -2158,6 +2174,201 @@ function registerTools(server) {
       };
     }
   );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 20: list_routes
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "list_routes",
+    "Возвращает список доступных маршрутов согласования 1С:БИТ.ФИНАНС по организациям. " +
+    "Показывает: организацию, тип документа, код маршрута, количество вариантов. " +
+    "Используйте для получения доступных организаций и типов документов перед вызовом suggest_route.",
+    {
+      org: z.string().optional().describe(
+        "Фильтр по организации/БЕ (частичное совпадение). Например: 'ГТИ', 'АФС', 'Ермаковское'. " +
+        "Если не указан — возвращаются все организации."
+      ),
+    },
+    async ({ org }) => {
+      try {
+        const result = listRoutes({ org });
+        return {
+          content: [{ type: "text", text: result.error
+            ? JSON.stringify({ error: result.message }, null, 2)
+            : result.formatted
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 21: suggest_route
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "suggest_route",
+    "Подбирает цепочку согласования документа в 1С:БИТ.ФИНАНС по параметрам документа. " +
+    "Возвращает последовательность шагов (Создание → Согласование → Утверждение) с конкретными ролями. " +
+    "Роли с постфиксом 'БЕ' (например 'Генеральный директор БЕ') привязаны к указанной организации. " +
+    "Реальные ФИО не хранятся — только роли/должности. " +
+    "Перед вызовом используйте list_routes чтобы узнать доступные организации и типы документов.",
+    {
+      org: z.string().describe(
+        "Организация/бизнес-единица. Например: 'ГТИ', 'АФС', 'Ермаковское'. " +
+        "Поддерживается частичное совпадение по коду или полному наименованию."
+      ),
+      doc_type: z.string().describe(
+        "Тип документа. Поддерживаются: 'ЦС-001' (Конкурентная карта), 'ЦС-002' (Заявка на МПЗ), " +
+        "'ЦС-003' (Заявка на затраты), 'ЦС-004' (Заявка на расход ДС), " +
+        "'ЦС-005' (Реестр платежей), 'ЦС-006' (Корректировка КВ), 'Заказ поставщику'. " +
+        "Принимаются как коды (ЦС-001), так и названия ('Заявка на МПЗ')."
+      ),
+      amount: z.number().optional().describe(
+        "Сумма документа в рублях. Влияет на пороговые условия согласования. " +
+        "Например: 3000000 (3 млн руб.). Если не указать — пороги по сумме не применяются."
+      ),
+      cfo: z.string().optional().describe(
+        "ЦФО (центр финансовой ответственности). Например: 'ГТИ-03ПО5 Месторождение Ермаковское', 'Закупки'. " +
+        "Влияет на выбор согласующего по ЦФО."
+      ),
+      project: z.string().optional().describe(
+        "Проект. Например: 'Ермаковское', 'Култума', 'Озерный', 'Лугокан'. " +
+        "Также влияет на выбор варианта маршрута если для проекта есть отдельный вариант."
+      ),
+      operation_type: z.string().optional().describe(
+        "Вид операции (для Заявки на расход ДС). Например: 'ОплатаПоставщику', " +
+        "'ПеречислениеПодотчетномуЛицу', 'УплатаНалога', 'ВозвратПокупателю'."
+      ),
+      dds_article: z.string().optional().describe(
+        "Статья ДДС. Например: '21102 НДФЛ', '212 Страховые взносы', '21918 Госпошлины и сборы прочие'."
+      ),
+      tk_type: z.string().optional().describe(
+        "Тип тендерного комитета (для Конкурентной карты). Значения: 'ЗаочныйТК' или 'ОчныйТК'."
+      ),
+      responsible: z.string().optional().describe(
+        "Ответственный в заказе (для Заказа поставщику). Например: 'ЗакупщикЛогистика', 'ЗакупщикБГК'."
+      ),
+    },
+    async ({ org, doc_type, amount, cfo, project, operation_type, dds_article, tk_type, responsible }) => {
+      try {
+        const result = suggestRoute({ org, doc_type, amount, cfo, project, operation_type, dds_article, tk_type, responsible });
+        return {
+          content: [{ type: "text", text: result.error
+            ? JSON.stringify({ error: result.message }, null, 2)
+            : result.formatted
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 22: get_route
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "get_route",
+    "Возвращает полное описание маршрута согласования — все варианты, все шаги, все условия — " +
+    "для указанной организации и типа документа. " +
+    "В отличие от suggest_route не фильтрует по параметрам, а показывает маршрут целиком. " +
+    "Используйте для изучения структуры маршрута или его документирования.",
+    {
+      org: z.string().describe(
+        "Организация/бизнес-единица. Например: 'ГТИ', 'АФС', 'Ермаковское'."
+      ),
+      doc_type: z.string().optional().describe(
+        "Тип документа. Если не указан — возвращаются все маршруты организации. " +
+        "Примеры: 'ЦС-002', 'Заявка на МПЗ', 'ЗаявкаНаМПЗ'."
+      ),
+    },
+    async ({ org, doc_type }) => {
+      try {
+        const result = getRoute({ org, doc_type });
+        return {
+          content: [{ type: "text", text: result.error
+            ? JSON.stringify({ error: result.message }, null, 2)
+            : JSON.stringify(result, null, 2)
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 23: compare_routes
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "compare_routes",
+    "Сравнивает маршруты согласования одного типа документа у двух разных организаций. " +
+    "Показывает: общие роли, уникальные роли каждой организации, структуру шагов. " +
+    "Пример: 'Чем отличается ЦС-002 у ГТИ от АФС?'",
+    {
+      org1: z.string().describe(
+        "Первая организация. Например: 'ГТИ'."
+      ),
+      org2: z.string().describe(
+        "Вторая организация. Например: 'АФС'."
+      ),
+      doc_type: z.string().describe(
+        "Тип документа для сравнения. Примеры: 'ЦС-002', 'Заявка на МПЗ'."
+      ),
+    },
+    async ({ org1, org2, doc_type }) => {
+      try {
+        const result = compareRoutes({ org1, org2, doc_type });
+        return {
+          content: [{ type: "text", text: result.error
+            ? JSON.stringify({ error: result.message }, null, 2)
+            : result.formatted
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ИНСТРУМЕНТ 24: validate_route_params
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  server.tool(
+    "validate_route_params",
+    "Проверяет корректность параметров перед вызовом suggest_route. " +
+    "Возвращает список ошибок (organization/doc_type не найдены) и предупреждений " +
+    "(сумма не указана, нестандартный тип документа). " +
+    "Используйте перед suggest_route если не уверены в корректности параметров.",
+    {
+      org: z.string().optional().describe("Организация для проверки."),
+      doc_type: z.string().optional().describe("Тип документа для проверки."),
+      amount: z.number().optional().describe("Сумма документа для проверки."),
+    },
+    async ({ org, doc_type, amount }) => {
+      try {
+        const result = validateRouteParams({ org, doc_type, amount });
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            valid:      result.valid,
+            issues:     result.issues,
+            warnings:   result.warnings,
+            normalized: result.normalized,
+            summary:    result.formatted,
+          }, null, 2) }],
+        };
+      } catch (err) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
 }
 
 // ── HTTP-сервер ───────────────────────────────────────────────────────────────
@@ -2205,6 +2416,9 @@ async function reloadKnowledgeBase(reason = "manual") {
         console.log(`🧠 Embedding-индекс обновлён: ${embResult.docs_count} документов`);
       }
     }).catch(() => {}); // Ошибки уже логируются внутри buildEmbeddingIndex
+
+    // Сброс кэша маршрутов согласования
+    try { reloadRoutesDb(); } catch (_) { /* routes_db.json может быть не изменён */ }
 
     return { success: true, docs_count: docs.length, elapsed_ms: elapsed, reloaded_at: lastReloadAt, index: idxStats };
   } catch (err) {
