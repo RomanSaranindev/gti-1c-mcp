@@ -115,6 +115,11 @@ export function getInstructionsByTopic(topic) {
   }));
 }
 
+/** Возвращает загруженные документы без повторного чтения диска. */
+export function getLoadedDocs() {
+  return INSTRUCTION_DOCS;
+}
+
 export function loadKnowledgeBase() {
   const docs = [];
   if (!fs.existsSync(KNOWLEDGE_DIR)) {
@@ -240,5 +245,5 @@ export function searchInstructions(query, { limit = 5 } = {}) {
   };
 }
 
-// Загружаем при старте
-loadKnowledgeBase();
+// Примечание: loadKnowledgeBase() больше не вызывается при импорте модуля.
+// Вызывается один раз из server.js после инициализации транспорта.

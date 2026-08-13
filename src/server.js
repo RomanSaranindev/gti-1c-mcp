@@ -82,6 +82,7 @@ import {
 
 import {
   loadKnowledgeBase,
+  getLoadedDocs,
   listInstructions,
   searchInstructions,
   getInstruction,
@@ -2627,18 +2628,45 @@ app.all("/mcp", async (req, res) => {
 // ── Запуск ────────────────────────────────────────────────────────────────────
 
 /**
- * Строим TF-IDF индекс (общая инициализация для обоих режимов)
+ * Полная инициализация базы знаний — вызывается ровно один раз при старте.
+ *
+ * Синхронно:
+ *   1. loadKnowledgeBase()   — читает .md файлы, стеммирует токены
+ *   2. buildTfidfIndex(docs) — строит TF-IDF индекс
+ *
+ * Асинхронно в фоне (не блокируют старт):
+ *   3. buildEmbeddingIndex() — загружает ONNX-модель, строит эмбеддинги
+ *   4. reloadRoutesDb()      — разбирает routes_db.json в память
  */
-function initTfidf() {
+function initAll() {
+  // ── 1+2: KB + TF-IDF (синхронно, один вызов loadKnowledgeBase) ──
+  let tfidfStats = null;
   try {
     const allDocs = loadKnowledgeBase();
     buildTfidfIndex(allDocs);
-    const stats = getIndexStats();
-    return stats;
+    tfidfStats = getIndexStats();
   } catch (err) {
     log(`⚠️  TF-IDF индекс не построен: ${err.message}`);
-    return null;
   }
+
+  // ── 3: Embedding-индекс — фоновая задача, не блокирует ──────────
+  // getLoadedDocs() возвращает уже загруженный массив — без повторного чтения диска
+  buildEmbeddingIndex(getLoadedDocs()).then((embResult) => {
+    if (embResult.is_ready) {
+      log(`🧠 Embedding-индекс готов: ${embResult.docs_count} документов`);
+    }
+  }).catch(() => {}); // ошибки уже логируются внутри buildEmbeddingIndex
+
+  // ── 4: Routes DB — предзагружаем в фоне через setImmediate ──────
+  setImmediate(() => {
+    try {
+      reloadRoutesDb();
+    } catch (err) {
+      log(`⚠️  Routes DB не загружена: ${err.message}`);
+    }
+  });
+
+  return tfidfStats;
 }
 
 // ── Режим stdio (для OpenCode / MCP-клиентов типа "local") ───────────────────
@@ -2654,10 +2682,14 @@ if (!process.stdin.isTTY) {
 
   const transport = new StdioServerTransport();
   server.connect(transport).then(() => {
-    // TF-IDF строим после подключения
-    const stats = initTfidf();
-    // В stdio-режиме логи идут в stderr (stdout занят протоколом)
-    process.stderr.write(`[gti-1c-mcp] stdio-режим запущен. Профилей: ${ACCESS_PROFILES.length}, инструкций: ${listInstructions().length}${stats ? `, TF-IDF: ${stats.docs_count} doc` : ""}\n`);
+    // Инициализируем всё после подключения — KB + TF-IDF синхронно,
+    // embedding + routes в фоне
+    const stats = initAll();
+    process.stderr.write(
+      `[gti-1c-mcp] stdio-режим запущен. Профилей: ${ACCESS_PROFILES.length}, ` +
+      `инструкций: ${listInstructions().length}` +
+      `${stats ? `, TF-IDF: ${stats.docs_count} doc` : ""}\n`
+    );
   }).catch((err) => {
     process.stderr.write(`[gti-1c-mcp] Ошибка запуска stdio: ${err.message}\n`);
     process.exit(1);
@@ -2670,9 +2702,10 @@ if (!process.stdin.isTTY) {
     log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
     log(`   Health-check : http://localhost:${PORT}/health`);
     log(`   Профилей     : ${ACCESS_PROFILES.length}`);
-    log(`   Инструкций   : ${listInstructions().length}`);
     log(`   API Token    : ${API_TOKEN}`);
-    const stats = initTfidf();
+    const stats = initAll();
     if (stats) log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
+    log(`   Инструкций   : ${listInstructions().length}`);
+    log(`   Embedding    : инициализируется в фоне...`);
   });
 }
