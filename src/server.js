@@ -35,6 +35,7 @@
  *  17. execute_1c_query               — произвольный запрос к данным 1С
  *  18. get_1c_metadata                — метаданные конфигурации 1С
  *  19. get_1c_documents               — документы БИТ.ФИНАНС с фильтрацией
+ *  20. get_visa_routes               — визы, маршруты, права установки, шаги алгоритма (живые данные)
  *
  * Маршруты согласования (knowledge/routes/routes_db.json):
  *  20. list_routes                    — список доступных маршрутов по организациям
@@ -1659,6 +1660,91 @@ function registerTools(server) {
     }
   );
 
+  // ── 18: get_visa_routes ────────────────────────────────────────────────────
+
+  server.tool(
+    "get_visa_routes",
+    "Получает актуальные данные по визам и маршрутам согласования из живой базы " +
+    "1С:БИТ.ФИНАНС в реальном времени. " +
+    "Режим visas — визы на документах с разбивкой по статусу (без ФИО, только должность). " +
+    "Режим routes — маршруты согласования и шаги алгоритма с составом виз. " +
+    "Режим rights — права установки виз (группы пользователей, без персональных данных). " +
+    "Режим algorithm — шаги алгоритма процесса из справочника бит_АлгоритмыПроцессов. " +
+    "Источники: РС.бит_УстановленныеВизы, РС.бит_ПраваУстановкиВиз, " +
+    "Справочник.бит_Визы, Справочник.бит_АлгоритмыПроцессов, бит_ТочкиАлгоритмов.",
+    {
+      mode: z.enum(["visas", "routes", "rights", "algorithm"]).describe(
+        "Режим выборки: " +
+        "visas — визы на документах (статус, должность, маршрут, шаг алгоритма); " +
+        "routes — уникальные маршруты с шагами алгоритма и составом виз; " +
+        "rights — матрица прав: кто может устанавливать каждую визу (группы, без ФИО); " +
+        "algorithm — шаги алгоритма процесса"
+      ),
+      visa_code: z.string().optional().describe(
+        "Кодификатор визы из Справочник.бит_Визы (например 'V-01'). Фильтр по визе."
+      ),
+      document_type: z.string().optional().describe(
+        "Тип документа для фильтрации (часть имени или синонима, например 'ЦС-004', 'ПутевойЛист'). " +
+        "Применяется только в режиме visas."
+      ),
+      status_filter: z.enum(["active", "signed", "rejected", "all"]).default("all").describe(
+        "Фильтр по статусу визы: active — только активные (ожидают подписи); " +
+        "signed — подписанные; rejected — отклонённые; all — все (по умолчанию). " +
+        "Применяется в режиме visas."
+      ),
+      date_from: z.string().optional().describe(
+        "Дата начала периода в формате ГГГГ-ММ-ДД. Фильтр по дате установки визы."
+      ),
+      date_to: z.string().optional().describe(
+        "Дата окончания периода в формате ГГГГ-ММ-ДД."
+      ),
+      algorithm_code: z.string().optional().describe(
+        "Код алгоритма процесса для режима algorithm. Если не указан — возвращает все алгоритмы."
+      ),
+      limit: z.number().int().min(1).max(200).default(50).describe(
+        "Максимум строк в ответе (по умолчанию 50, максимум 200)."
+      ),
+    },
+    async ({ mode, visa_code, document_type, status_filter, date_from, date_to, algorithm_code, limit }) => {
+      try {
+        const result = await callOnecTool("get_visa_routes", {
+          mode,
+          visa_code:      visa_code      || "",
+          document_type:  document_type  || "",
+          status_filter:  status_filter  || "all",
+          date_from:      date_from      || "",
+          date_to:        date_to        || "",
+          algorithm_code: algorithm_code || "",
+          limit,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source:   "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              mode,
+              filters: { visa_code, document_type, status_filter, date_from, date_to, algorithm_code },
+              ...result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Проверьте правильность параметров. " +
+              "Используйте onec_health для диагностики подключения к 1С. " +
+              "Убедитесь что расширение MCP_Сервер.cfe обновлено (содержит get_visa_routes)."
+            ),
+          }],
+        };
+      }
+    }
+  );
+
   // ═══════════════════════════════════════════════════════════════════════════
   // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 11: search_by_role
@@ -2494,7 +2580,7 @@ app.get("/health", async (req, res) => {
     status: "ok",
     server: "gti-1c-mcp",
     version: "3.0.0",
-    tools_count: 19,
+    tools_count: 20,
     tools: [
       // База знаний (объединено: было 5 → стало 3)
       "list_instructions",          // фильтры: code, keyword, topic, list_topics
@@ -2520,6 +2606,7 @@ app.get("/health", async (req, res) => {
       "execute_1c_query",
       "get_1c_metadata",
       "get_1c_documents",
+      "get_visa_routes",           // визы, маршруты, права, алгоритмы (живые данные)
     ],
     profiles_count: ACCESS_PROFILES.length,
     knowledge_base: {
@@ -2562,7 +2649,7 @@ app.get("/", (req, res) => {
       rbac_profiles:   ["suggest_access_profile", "get_roles_matrix", "analyze_roles", "explain_profile", "search_by_role", "get_profiles_by_function"],
       job_mapping:     ["suggest_profile_by_job", "list_jobs"],
       access_journey:  ["get_instruction_access_requirements", "get_user_access_journey"],
-      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents"],
+      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents", "get_visa_routes"],
     },
     onec_integration: {
       configured: onecCfg.configured,

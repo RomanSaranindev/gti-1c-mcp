@@ -22,6 +22,49 @@
 
 // ── Конфигурация ──────────────────────────────────────────────────────────────
 
+import https from "node:https";
+import http from "node:http";
+
+// Разрешить самоподписанные SSL и TLS renegotiation (корпоративный IIS)
+const _tlsAgent = new https.Agent({ rejectUnauthorized: false });
+
+/**
+ * Универсальный HTTP-запрос через встроенный https/http модуль Node.js.
+ * Заменяет fetch() — поддерживает TLS renegotiation, которую undici не поддерживает.
+ */
+function _request(url, { method = "GET", headers = {}, body = null, timeout = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === "https:";
+    const lib = isHttps ? https : http;
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method,
+      headers,
+      agent: isHttps ? _tlsAgent : undefined,
+    };
+    const req = lib.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          text: () => Promise.resolve(text),
+          json: () => Promise.resolve(JSON.parse(text)),
+        });
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeout, () => { req.destroy(new Error("timeout")); });
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 const ONEC_URL = (process.env.ONEC_URL || "").replace(/\/$/, "");
 const ONEC_USERNAME = process.env.ONEC_USERNAME || "";
 const ONEC_PASSWORD = process.env.ONEC_PASSWORD || "";
@@ -81,13 +124,9 @@ export async function onecRpc(method, params = {}) {
     params,
   });
 
-  // AbortController для таймаута (нативный fetch)
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ONEC_TIMEOUT);
-
   let response;
   try {
-    response = await fetch(rpcUrl, {
+    response = await _request(rpcUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -95,17 +134,15 @@ export async function onecRpc(method, params = {}) {
         "Accept": "application/json",
       },
       body,
-      signal: controller.signal,
+      timeout: ONEC_TIMEOUT,
     });
   } catch (err) {
-    if (err.name === "AbortError") {
+    if (err.message === "timeout") {
       throw new OnecTimeoutError(
         `Таймаут запроса к 1С (${ONEC_TIMEOUT}мс). Проверьте доступность ${rpcUrl}.`
       );
     }
     throw new OnecNetworkError(`Ошибка сети при подключении к 1С: ${err.message}`);
-  } finally {
-    clearTimeout(timer);
   }
 
   // Проверяем HTTP-статус
@@ -186,16 +223,13 @@ export async function checkOnecHealth({ force = false } = {}) {
 
   const healthUrl = `${ONEC_URL}/hs/${ONEC_SERVICE_ROOT}/health`;
   const credentials = Buffer.from(`${ONEC_USERNAME}:${ONEC_PASSWORD}`).toString("base64");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
 
   let result;
   try {
-    const response = await fetch(healthUrl, {
+    const response = await _request(healthUrl, {
       headers: { "Authorization": `Basic ${credentials}` },
-      signal: controller.signal,
+      timeout: 10000,
     });
-    clearTimeout(timer);
     if (response.ok) {
       const json = await response.json().catch(() => ({}));
       result = { ok: true, detail: json.status || "ok" };
@@ -203,8 +237,7 @@ export async function checkOnecHealth({ force = false } = {}) {
       result = { ok: false, detail: `HTTP ${response.status}` };
     }
   } catch (err) {
-    clearTimeout(timer);
-    result = { ok: false, detail: err.name === "AbortError" ? "timeout" : err.message };
+    result = { ok: false, detail: err.message === "timeout" ? "timeout" : err.message };
   }
 
   if (result.ok) {
