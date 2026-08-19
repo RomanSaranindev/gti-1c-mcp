@@ -115,6 +115,8 @@ import {
   formatOnecError,
 } from "./onec_client.js";
 
+import { renderRouteMermaid } from "./route_mermaid.js";
+
 import {
   reloadDb as reloadRoutesDb,
   suggestRoute,
@@ -359,6 +361,8 @@ function enrichRequestText(requestText, questions, answers) {
   });
   return parts.join(". ");
 }
+
+// Блок-схема маршрута согласования вынесена в отдельный модуль (см. route_mermaid.js)
 
 // ── Регистрация инструментов ──────────────────────────────────────────────────
 
@@ -1506,12 +1510,70 @@ function registerTools(server) {
       ),
     },
     async ({ query_text, params, limit }) => {
+      // Защита от изменяющих конструкций: инструмент заявлен как read-only.
+      // Проверяем до отправки в 1С — не полагаемся на защиту внутри расширения.
+      const FORBIDDEN = [
+        "УНИЧТОЖИТЬ", "DROP",
+        "ИЗМЕНИТЬ", "ALTER",
+        "УДАЛИТЬ", "DELETE",
+        "ВСТАВИТЬ", "INSERT",
+        "ОБНОВИТЬ", "UPDATE",
+      ];
+      const upper = query_text.toUpperCase();
+      const hit = FORBIDDEN.find((kw) => new RegExp(`(^|[^А-ЯA-Z])${kw}([^А-ЯA-Z]|$)`).test(upper));
+      if (hit) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: "ReadOnlyViolation",
+              message: `Запрос содержит изменяющую конструкцию '${hit}'. ` +
+                       `Инструмент допускает только запросы на чтение (ВЫБРАТЬ).`,
+              requested_query: query_text,
+            }, null, 2),
+          }],
+        };
+      }
+
       try {
+        // Инструмент появляется в расширении не во всех версиях — если его нет,
+        // сообщаем об этом явно, а не отдаём криптовую ошибку JSON-RPC.
+        const available = await listOnecTools();
+        const names = (available?.tools || []).map((t) => t.name);
+        if (!names.includes("execute_query")) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "NotSupported",
+                message:
+                  "Установленная версия расширения MCP_Сервер.cfe не содержит инструмент " +
+                  "execute_query. Обновите расширение в базе и перезапустите сеансы 1С.",
+                requested_query: query_text,
+                onec_url: getOnecConfig().url,
+                available_1c_tools: names,
+                alternatives: [
+                  "get_visa_routes — визы, маршруты, права, шаги алгоритма, граф маршрута",
+                  "get_1c_metadata — список объектов и структура",
+                ],
+              }, null, 2),
+            }],
+          };
+        }
+
         const result = await callOnecTool("execute_query", {
           query: query_text,
+          query_text,
           params: params || {},
           limit,
         });
+
+        // Расширение отдаёт результат текстом внутри content[0].text — разбираем
+        let payload = result;
+        const rawText = result?.content?.[0]?.text;
+        if (typeof rawText === "string") {
+          try { payload = JSON.parse(rawText); } catch { payload = { result: rawText }; }
+        }
 
         return {
           content: [{
@@ -1520,7 +1582,7 @@ function registerTools(server) {
               source: "1C:БИТ.ФИНАНС (живая база)",
               onec_url: getOnecConfig().url,
               query: query_text,
-              ...result,
+              ...payload,
             }, null, 2),
           }],
         };
@@ -1529,7 +1591,8 @@ function registerTools(server) {
           content: [{
             type: "text",
             text: formatOnecError(err,
-              "Проверьте синтаксис запроса. Используйте get_1c_metadata чтобы узнать доступные объекты."
+              "Проверьте синтаксис запроса. Используйте get_1c_metadata чтобы узнать " +
+              "правильные имена таблиц и полей."
             ),
           }],
         };
@@ -1563,11 +1626,67 @@ function registerTools(server) {
     },
     async ({ object_type, object_name, include_attributes }) => {
       try {
-        const result = await callOnecTool("get_metadata", {
-          object_type,
-          object_name: object_name || "",
-          include_attributes,
-        });
+        // Расширение предоставляет два инструмента вместо одного get_metadata:
+        //   list_metadata_objects  — список объектов по типу и маске имени
+        //   get_metadata_structure — структура конкретного объекта (нужно точное имя)
+        const TYPE_MAP = {
+          catalogs:               ["Catalogs"],
+          documents:              ["Documents"],
+          registers_info:         ["InformationRegisters"],
+          registers_accumulation: ["AccumulationRegisters"],
+          registers_accounting:   ["AccountingRegisters"],
+          all: ["Catalogs", "Documents", "InformationRegisters",
+                "AccumulationRegisters", "AccountingRegisters"],
+        };
+        const metaTypes = TYPE_MAP[object_type] || TYPE_MAP.all;
+
+        // 1. Собираем список объектов по каждому типу метаданных
+        const objects = [];
+        for (const metaType of metaTypes) {
+          const listed = await callOnecTool("list_metadata_objects", {
+            metaType,
+            nameMask: object_name || "",
+            maxItems: 200,
+          });
+          const raw = listed?.content?.[0]?.text ?? "";
+          for (const line of String(raw).split("\n").map((s) => s.trim()).filter(Boolean)) {
+            // Формат строки: "Справочник.Контрагенты (Контрагенты)"
+            const m = line.match(/^(\S+)\s*(?:\((.*)\))?$/);
+            objects.push({
+              meta_type: metaType,
+              full_name: m ? m[1] : line,
+              name: (m ? m[1] : line).split(".").pop(),
+              synonym: m?.[2] ?? "",
+            });
+          }
+        }
+
+        // 2. При include_attributes догружаем структуру (ограниченно — запрос на объект)
+        let structures;
+        if (include_attributes && objects.length > 0) {
+          const MAX_STRUCTURES = 10;
+          structures = [];
+          for (const obj of objects.slice(0, MAX_STRUCTURES)) {
+            try {
+              const st = await callOnecTool("get_metadata_structure", {
+                metaType: obj.meta_type,
+                name: obj.name,
+              });
+              structures.push({
+                full_name: obj.full_name,
+                structure: st?.content?.[0]?.text ?? st,
+              });
+            } catch (e) {
+              structures.push({ full_name: obj.full_name, error: e.message });
+            }
+          }
+          if (objects.length > MAX_STRUCTURES) {
+            structures.push({
+              note: `Структуры загружены только для первых ${MAX_STRUCTURES} объектов из ${objects.length}. ` +
+                    `Уточните object_name чтобы сузить выборку.`,
+            });
+          }
+        }
 
         return {
           content: [{
@@ -1575,7 +1694,11 @@ function registerTools(server) {
             text: JSON.stringify({
               source: "1C:БИТ.ФИНАНС (живая база)",
               onec_url: getOnecConfig().url,
-              ...result,
+              object_type,
+              filter: object_name || null,
+              count: objects.length,
+              objects,
+              ...(structures ? { structures } : {}),
             }, null, 2),
           }],
         };
@@ -1670,22 +1793,29 @@ function registerTools(server) {
     "Режим routes — маршруты согласования и шаги алгоритма с составом виз. " +
     "Режим rights — права установки виз (группы пользователей, без персональных данных). " +
     "Режим algorithm — шаги алгоритма процесса из справочника бит_АлгоритмыПроцессов. " +
+    "Режим route_graph — БЛОК-СХЕМА маршрута: узлы и переходы алгоритма, " +
+    "дополнительно возвращается готовая диаграмма Mermaid (flowchart). " +
     "Источники: РС.бит_УстановленныеВизы, РС.бит_ПраваУстановкиВиз, " +
     "Справочник.бит_Визы, Справочник.бит_АлгоритмыПроцессов, бит_ТочкиАлгоритмов.",
     {
-      mode: z.enum(["visas", "routes", "rights", "algorithm"]).describe(
+      mode: z.enum(["visas", "routes", "rights", "algorithm", "route_graph"]).describe(
         "Режим выборки: " +
         "visas — визы на документах (статус, должность, маршрут, шаг алгоритма); " +
         "routes — уникальные маршруты с шагами алгоритма и составом виз; " +
         "rights — матрица прав: кто может устанавливать каждую визу (группы, без ФИО); " +
-        "algorithm — шаги алгоритма процесса"
+        "algorithm — шаги алгоритма процесса; " +
+        "route_graph — блок-схема маршрута (узлы + переходы + Mermaid-диаграмма)"
       ),
       visa_code: z.string().optional().describe(
-        "Кодификатор визы из Справочник.бит_Визы (например 'V-01'). Фильтр по визе."
+        "Фильтр по визе из Справочник.бит_Визы. Ищется вхождение в НАИМЕНОВАНИЕ визы " +
+        "(например 'Операционный директор', 'Главный механик'), либо точное совпадение " +
+        "с ЛИТЕРОЙ (например 'ОД', 'РПО', 'НОАЗ'). " +
+        "ВАЖНО: реквизит Кодификатор в базе не заполнен — фильтровать по коду вида 'V-01' нельзя."
       ),
       document_type: z.string().optional().describe(
         "Тип документа для фильтрации (часть имени или синонима, например 'ЦС-004', 'ПутевойЛист'). " +
-        "Применяется только в режиме visas."
+        "В режимах visas/routes — фильтр по типу документа; " +
+        "в режиме route_graph — поиск по наименованию алгоритма (например 'Заявка на затраты')."
       ),
       status_filter: z.enum(["active", "signed", "rejected", "all"]).default("all").describe(
         "Фильтр по статусу визы: active — только активные (ожидают подписи); " +
@@ -1699,7 +1829,8 @@ function registerTools(server) {
         "Дата окончания периода в формате ГГГГ-ММ-ДД."
       ),
       algorithm_code: z.string().optional().describe(
-        "Код алгоритма процесса для режима algorithm. Если не указан — возвращает все алгоритмы."
+        "Код алгоритма процесса для режимов algorithm и route_graph " +
+        "(например 'БС-000753'). Если не указан — возвращает все алгоритмы."
       ),
       limit: z.number().int().min(1).max(200).default(50).describe(
         "Максимум строк в ответе (по умолчанию 50, максимум 200)."
@@ -1718,6 +1849,24 @@ function registerTools(server) {
           limit,
         });
 
+        // Расширение возвращает JSON строкой внутри content[0].text — разбираем,
+        // чтобы отдать агенту структуру, а не строку в строке.
+        let payload = result;
+        const rawText = result?.content?.[0]?.text;
+        if (typeof rawText === "string") {
+          try { payload = JSON.parse(rawText); } catch { payload = { raw: rawText }; }
+        }
+
+        // Для блок-схемы дополнительно рендерим Mermaid
+        let diagrams;
+        if (mode === "route_graph" && Array.isArray(payload?.graphs)) {
+          diagrams = payload.graphs.map((g) => ({
+            algorithm_code: g.algorithm_code,
+            algorithm_name: g.algorithm_name,
+            mermaid: renderRouteMermaid(g),
+          }));
+        }
+
         return {
           content: [{
             type: "text",
@@ -1726,7 +1875,8 @@ function registerTools(server) {
               onec_url: getOnecConfig().url,
               mode,
               filters: { visa_code, document_type, status_filter, date_from, date_to, algorithm_code },
-              ...result,
+              ...payload,
+              ...(diagrams ? { diagrams } : {}),
             }, null, 2),
           }],
         };

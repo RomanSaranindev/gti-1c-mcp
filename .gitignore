@@ -1,6 +1,12 @@
 node_modules/
 .env
 *.log
+*.log.*.gz
+server_logs.txt
+
+# Резервные копии расширения 1С
+*.cfe.backup
+
 
 # Исходные данные с персональной информацией — не коммитить
 Employee database.xlsx
