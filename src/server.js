@@ -1895,6 +1895,76 @@ function registerTools(server) {
     }
   );
 
+  // ── 19: get_user_rights ────────────────────────────────────────────────────
+  //
+  // Возвращает группы доступа и профили пользователя по UID
+  // (ИдентификаторПользователяИБ из Справочник.Пользователи).
+  // ФИО и персональные данные НЕ передаются — только анонимный идентификатор.
+  //
+
+  server.tool(
+    "get_user_rights",
+    "Возвращает группы доступа и профили пользователя 1С по UID (ИдентификаторПользователяИБ). " +
+    "ФИО и контактные данные НЕ передаются — только анонимный идентификатор (UUID). " +
+    "Показывает: к каким группам доступа относится пользователь, какой профиль у каждой группы, " +
+    "опционально — виды доступа (ЦФО, склады, подразделения). " +
+    "UID берётся из поля ИдентификаторПользователяИБ справочника Пользователи — " +
+    "он уникален для каждого объекта и каждой базы 1С. " +
+    "Деанонимизация невозможна без прямого доступа к базе. " +
+    "Требует настроенного подключения к 1С и расширения MCP_Сервер.cfe.",
+    {
+      user_uid: z.string().describe(
+        "UID пользователя — значение реквизита ИдентификаторПользователяИБ из Справочник.Пользователи. " +
+        "Формат: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'. " +
+        "ФИО не передаётся и не используется — только UID для анонимного поиска."
+      ),
+      include_access_values: z.enum(["true", "false"]).default("false").describe(
+        "true — включать виды доступа группы (ЦФО, склады, подразделения) в ответ. По умолчанию false."
+      ),
+      limit: z.number().int().min(1).max(200).default(50).describe(
+        "Максимум групп доступа в ответе (по умолчанию 50)."
+      ),
+    },
+    async ({ user_uid, include_access_values, limit }) => {
+      try {
+        const result = await callOnecTool("get_user_rights", {
+          user_uid,
+          include_access_values: include_access_values || "false",
+          limit,
+        });
+
+        let payload = result;
+        const rawText = result?.content?.[0]?.text;
+        if (typeof rawText === "string") {
+          try { payload = JSON.parse(rawText); } catch { payload = { raw: rawText }; }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              source:   "1C:БИТ.ФИНАНС (живая база)",
+              onec_url: getOnecConfig().url,
+              ...payload,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: formatOnecError(err,
+              "Проверьте формат user_uid (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx). " +
+              "UID берётся из поля ИдентификаторПользователяИБ справочника Пользователи. " +
+              "Используйте execute_1c_query для получения UID: " +
+              "ВЫБРАТЬ ИдентификаторПользователяИБ КАК uid ИЗ Справочник.Пользователи"
+            ),
+          }],
+        };
+      }
+    }
+  );
+
   // ═══════════════════════════════════════════════════════════════════════════
   // ═══════════════════════════════════════════════════════════════════════════
   // ИНСТРУМЕНТ 11: search_by_role
@@ -2757,6 +2827,7 @@ app.get("/health", async (req, res) => {
       "get_1c_metadata",
       "get_1c_documents",
       "get_visa_routes",           // визы, маршруты, права, алгоритмы (живые данные)
+      "get_user_rights",           // группы доступа + профили по UID (без ФИО)
     ],
     profiles_count: ACCESS_PROFILES.length,
     knowledge_base: {
@@ -2799,7 +2870,7 @@ app.get("/", (req, res) => {
       rbac_profiles:   ["suggest_access_profile", "get_roles_matrix", "analyze_roles", "explain_profile", "search_by_role", "get_profiles_by_function"],
       job_mapping:     ["suggest_profile_by_job", "list_jobs"],
       access_journey:  ["get_instruction_access_requirements", "get_user_access_journey"],
-      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents", "get_visa_routes"],
+      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents", "get_visa_routes", "get_user_rights"],
     },
     onec_integration: {
       configured: onecCfg.configured,
