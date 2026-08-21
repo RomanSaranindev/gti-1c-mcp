@@ -24,9 +24,35 @@
 
 import https from "node:https";
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-// Разрешить самоподписанные SSL и TLS renegotiation (корпоративный IIS)
-const _tlsAgent = new https.Agent({ rejectUnauthorized: false });
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Строгая проверка TLS. Сертификат корпоративного IIS выпущен внутренним УЦ,
+// поэтому его корневые сертификаты добавляются к доверенным явно —
+// отключать проверку нельзя: по этому каналу уходит пароль 1С.
+//
+// CA читаем в коде, а не через NODE_EXTRA_CA_CERTS: эта переменная
+// обрабатывается Node до запуска скрипта и понимает только абсолютный путь,
+// поэтому 'cert/hg-ca-bundle.pem' в .env молча игнорируется. Путь ниже
+// разрешается относительно корня проекта и работает при любом рабочем каталоге.
+const CA_PATH = process.env.ONEC_CA_BUNDLE
+  ? path.resolve(process.env.ONEC_CA_BUNDLE)
+  : path.join(__dirname, "..", "cert", "hg-ca-bundle.pem");
+
+let _ca;
+try {
+  _ca = fs.readFileSync(CA_PATH);
+} catch {
+  // Бандла нет — работаем на системном хранилище доверенных корней.
+  // Для публичного сертификата этого достаточно; для внутреннего УЦ
+  // соединение упадёт с понятным 'unable to get local issuer certificate'.
+  _ca = undefined;
+}
+
+const _tlsAgent = new https.Agent({ keepAlive: true, ca: _ca });
 
 /**
  * Универсальный HTTP-запрос через встроенный https/http модуль Node.js.
@@ -83,6 +109,49 @@ const ONEC_PASSWORD = process.env.ONEC_PASSWORD || "";
 const ONEC_SERVICE_ROOT = process.env.ONEC_SERVICE_ROOT || "mcp";
 const ONEC_TIMEOUT = parseInt(process.env.ONEC_TIMEOUT || "30000");
 
+// ── Учётные данные текущего запроса ──────────────────────────────────────────
+//
+// Делегирование identity: запрос к 1С выполняется под доменной учёткой того
+// пользователя, чей токен предъявлен. Тогда RLS и права базы применяются к нему,
+// а не к общему техпользователю — это и есть «данные только те, что разрешены».
+//
+// AsyncLocalStorage, а не глобальная переменная: инструменты работают
+// параллельно, и присваивание в общую переменную привело бы к тому, что
+// запрос одного пользователя ушёл бы под учёткой другого.
+
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const credentialStore = new AsyncLocalStorage();
+
+/**
+ * Выполняет функцию в контексте учётных данных пользователя.
+ *
+ * @param {{ username: string, password: string }} creds
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ * @template T
+ */
+export function withCredentials(creds, fn) {
+  return credentialStore.run(creds, fn);
+}
+
+/**
+ * Учётные данные текущего запроса.
+ * Вне контекста withCredentials — общие ONEC_* из .env (stdio-режим, health-check).
+ *
+ * @returns {{ username: string, password: string }}
+ */
+function currentCredentials() {
+  return credentialStore.getStore()
+    || { username: ONEC_USERNAME, password: ONEC_PASSWORD };
+}
+
+/** Собирает заголовок Basic-авторизации для текущего пользователя. */
+function authHeader() {
+  const { username, password } = currentCredentials();
+  return "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
+}
+
 /**
  * Проверяет, настроено ли подключение к 1С.
  * @returns {boolean}
@@ -126,7 +195,6 @@ async function _onecRpcOnce(method, params = {}) {
   }
 
   const rpcUrl = `${ONEC_URL}/hs/${ONEC_SERVICE_ROOT}/rpc`;
-  const credentials = Buffer.from(`${ONEC_USERNAME}:${ONEC_PASSWORD}`).toString("base64");
   const id = _requestId++;
 
   const body = JSON.stringify({
@@ -142,7 +210,7 @@ async function _onecRpcOnce(method, params = {}) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Basic ${credentials}`,
+        "Authorization": authHeader(),
         "Accept": "application/json",
       },
       body,
@@ -296,11 +364,14 @@ export function unwrapOnecPayload(result) {
 // ── Кэш health-check (TTL 60 сек, сбрасывается при ошибке) ──────────────────
 
 const HEALTH_CACHE_TTL = 60_000; // мс
-let _healthCache = null; // { result: {ok, detail}, at: timestamp }
+
+// Кэш пер-пользователя: health проверяет в том числе авторизацию, поэтому
+// общий кэш скрыл бы неверный пароль одного пользователя за успехом другого.
+const _healthCache = new Map(); // username → { result, at }
 
 /** Принудительно сбрасывает кэш health (например после изменения конфигурации). */
 export function clearHealthCache() {
-  _healthCache = null;
+  _healthCache.clear();
 }
 
 /**
@@ -314,18 +385,19 @@ export async function checkOnecHealth({ force = false } = {}) {
     return { ok: false, detail: "Не настроено (нет ONEC_URL или ONEC_USERNAME)" };
   }
 
-  // Отдаём кэш если актуален
-  if (!force && _healthCache && (Date.now() - _healthCache.at) < HEALTH_CACHE_TTL) {
-    return { ..._healthCache.result, cached: true };
+  // Ключ кэша — пользователь, под которым идёт проверка
+  const cacheKey = currentCredentials().username;
+  const cached = _healthCache.get(cacheKey);
+  if (!force && cached && (Date.now() - cached.at) < HEALTH_CACHE_TTL) {
+    return { ...cached.result, cached: true };
   }
 
   const healthUrl = `${ONEC_URL}/hs/${ONEC_SERVICE_ROOT}/health`;
-  const credentials = Buffer.from(`${ONEC_USERNAME}:${ONEC_PASSWORD}`).toString("base64");
 
   let result;
   try {
     const response = await _request(healthUrl, {
-      headers: { "Authorization": `Basic ${credentials}` },
+      headers: { "Authorization": authHeader() },
       timeout: 10000,
     });
     if (response.ok) {
@@ -340,10 +412,10 @@ export async function checkOnecHealth({ force = false } = {}) {
 
   if (result.ok) {
     // Кэшируем только успешный результат
-    _healthCache = { result, at: Date.now() };
+    _healthCache.set(cacheKey, { result, at: Date.now() });
   } else {
     // При ошибке — сбрасываем кэш чтобы следующий вызов снова делал запрос
-    _healthCache = null;
+    _healthCache.delete(cacheKey);
   }
 
   return result;

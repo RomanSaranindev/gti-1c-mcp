@@ -1,7 +1,7 @@
 {
   "name": "gti-1c-mcp",
-  "version": "2.1.0",
-  "description": "MCP-сервер: база знаний инструкций 1С.БИТ и подбор профилей доступа RBAC",
+  "version": "3.0.0",
+  "description": "MCP-сервер: база знаний инструкций 1С.БИТ, маршруты согласования и доступ к живой базе 1С:БИТ.ФИНАНС",
   "type": "module",
   "main": "src/server.js",
   "bin": {
@@ -10,11 +10,15 @@
   "files": [
     "src/",
     "knowledge/",
+    "tools/token.mjs",
     ".env.example"
   ],
   "scripts": {
     "start": "node --env-file=.env src/server.js",
-    "dev": "node --env-file=.env --watch src/server.js"
+    "dev": "node --env-file=.env --watch src/server.js",
+    "stdio": "node --env-file=.env src/server.js --stdio",
+    "token": "node --env-file=.env tools/token.mjs",
+    "check": "node tools/check_all.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
