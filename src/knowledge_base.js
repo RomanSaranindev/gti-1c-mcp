@@ -144,6 +144,16 @@ export function loadKnowledgeBase() {
     const title = titleLine.replace(/^#\s+/, "").trim();
     const topic = detectTopic(file, content);
 
+    const tokens = tokenize(content);
+
+    // Частотный индекс токенов — строится ОДИН раз при загрузке.
+    // Без него searchInstructions делал два полных прохода по массиву
+    // на каждый токен запроса (includes + filter) — O(docs × qTokens × docTokens).
+    const tokenFreq = new Map();
+    for (const t of tokens) {
+      tokenFreq.set(t, (tokenFreq.get(t) || 0) + 1);
+    }
+
     docs.push({
       id: file,
       file,
@@ -153,7 +163,12 @@ export function loadKnowledgeBase() {
       title: title || file.replace(/\.md$/, ""),
       topic,
       content,
-      tokens: tokenize(content),
+      tokens,
+      tokenFreq,
+      // Стеммы заголовка — тоже один раз, а не в двойном цикле поиска
+      titleTokens: new Set(tokenize(title || file.replace(/\.md$/, ""))),
+      // Нормализованный код для точного совпадения без повторной нормализации
+      codeNorm: header.code ? normalize(header.code) : "",
       charCount: content.length
     });
   }
@@ -205,20 +220,18 @@ export function searchInstructions(query, { limit = 5 } = {}) {
     for (const tok of qTokens) {
       let hit = false;
 
-      // Совпадение в заголовке (сравниваем стем с стемами заголовка)
-      const titleStems = tokenize(doc.title || "");
-      if (titleStems.includes(tok)) { score += 5; hit = true; }
+      // Совпадение в заголовке — Set.has() вместо tokenize() + includes()
+      if (doc.titleTokens.has(tok)) { score += 5; hit = true; }
 
       // Совпадение в коде инструкции (без стеммера — точное)
-      if (doc.code && normalize(doc.code).includes(tok)) { score += 6; hit = true; }
+      if (doc.codeNorm && doc.codeNorm.includes(tok)) { score += 6; hit = true; }
 
-      // Совпадение в теле (стемированные токены документа)
-      if (doc.tokens.includes(tok)) { score += 2; hit = true; }
+      // Частота токена в теле — Map.get() за O(1) вместо includes() + filter()
+      const freq = doc.tokenFreq.get(tok) || 0;
+      if (freq > 0) { score += 2; hit = true; }
 
       if (hit) matched.add(tok);
 
-      // Частота токена в теле документа
-      const freq = doc.tokens.filter(t => t === tok).length;
       score += Math.min(freq, 10) * 1.5;
     }
 
