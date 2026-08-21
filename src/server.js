@@ -9,7 +9,7 @@
  *
  * База знаний инструкций 1С.БИТ:
  *   1. list_instructions              — список инструкций (фильтры: code, keyword, topic, list_topics)
- *   2. search_instructions            — поиск: keyword / semantic (TF-IDF + embedding) / auto
+ *   2. search_instructions            — поиск: keyword / semantic (TF-IDF + cosine) / auto
  *   3. get_instruction                — полный текст инструкции по id или коду (ИП-301 и т.д.)
  *
  * Профили доступа и матрица ролей RBAC:
@@ -100,12 +100,6 @@ import {
 } from "./vector_search.js";
 
 import {
-  buildEmbeddingIndex,
-  embeddingSearch,
-  getEmbeddingStats,
-} from "./embedding_search.js";
-
-import {
   isOnecConfigured,
   getOnecConfig,
   onecRpc,
@@ -113,7 +107,15 @@ import {
   checkOnecHealth,
   listOnecTools,
   formatOnecError,
+  unwrapOnecPayload,
 } from "./onec_client.js";
+
+import {
+  jsonReply,
+  liveReply,
+  errorReply,
+  onecTool,
+} from "./mcp_reply.js";
 
 import { renderRouteMermaid } from "./route_mermaid.js";
 
@@ -146,6 +148,58 @@ if (!process.env.MCP_API_TOKEN) {
     "Смените переменную окружения перед публичным деплоем!"
   );
 }
+
+// ── Реестр инструментов ───────────────────────────────────────────────────────
+//
+// Единый источник правды для /health и /. Раньше эти списки велись отдельно
+// и разошлись: шапка файла заявляла 18 инструментов, /health — 20, / — 24,
+// фактически зарегистрировано 27. Теперь оба эндпоинта читают отсюда.
+//
+// При добавлении нового server.tool() — обязательно добавить имя в нужную группу.
+
+const TOOL_GROUPS = {
+  knowledge_base: [
+    "list_instructions",                    // фильтры: code, keyword, topic, list_topics
+    "search_instructions",                  // mode: auto | semantic | keyword
+    "get_instruction",
+  ],
+  rbac_profiles: [
+    "suggest_access_profile",               // двухшаговый протокол + generate_request_text
+    "get_roles_matrix",
+    "analyze_roles",                        // validate_roles + get_approval_level
+    "explain_profile",
+    "search_by_role",
+    "get_profiles_by_function",
+  ],
+  job_mapping: [
+    "suggest_profile_by_job",               // + include_explanation
+    "list_jobs",
+  ],
+  access_journey: [
+    "get_instruction_access_requirements",
+    "get_user_access_journey",
+  ],
+  routes: [
+    "list_routes",
+    "suggest_route",
+    "get_route",
+    "compare_routes",
+    "validate_route_params",
+  ],
+  live_1c: [
+    "onec_health",                          // кэш 60 сек
+    "list_1c_users",                        // без ФИО — только user_uid
+    "get_1c_access_groups",
+    "execute_1c_query",
+    "get_1c_metadata",
+    "get_1c_documents",
+    "get_visa_routes",                      // визы, маршруты, права, алгоритмы, граф
+    "get_user_rights",                      // группы + профили по user_ref (без ФИО)
+    "get_user_visas",                       // визы по user_uid (без ФИО)
+  ],
+};
+
+const TOOL_GROUPS_FLAT = Object.values(TOOL_GROUPS).flat();
 
 // ── Адаптивные уточняющие вопросы ────────────────────────────────────────────
 
@@ -470,56 +524,39 @@ function registerTools(server) {
         "Максимум результатов (по умолчанию 5)"
       ),
       mode: z.enum(["auto", "semantic", "keyword"]).default("auto").describe(
-        "'auto' — embedding если готов, иначе TF-IDF (рекомендуется). " +
-        "'semantic' — TF-IDF + cosine (офлайн, всегда доступен). " +
-        "'keyword' — точный полнотекстовый поиск."
+        "'auto' — то же что 'semantic' (рекомендуется). " +
+        "'semantic' — TF-IDF + cosine similarity, понимает синонимы и смысл запроса. " +
+        "'keyword' — точный полнотекстовый поиск по словам."
       ),
       min_score: z.number().min(0).max(1).default(0.01).describe(
-        "Минимальный порог релевантности (0.0–1.0). " +
-        "Для embedding-режима рекомендуется 0.3+"
+        "Минимальный порог релевантности (0.0–1.0)."
       ),
     },
     async ({ query, limit, mode, min_score }) => {
-
-      // ── Режим keyword ────────────────────────────────────────────────────
-      if (mode === "keyword") {
-        const result = searchInstructions(query, { limit });
-        return {
-          content: [{ type: "text", text: JSON.stringify({ ...result, search_mode: "keyword" }, null, 2) }],
-        };
-      }
-
-      // ── Режим auto / semantic: пробуем embedding ─────────────────────────
-      if (mode === "auto" || mode === "semantic") {
-        if (mode === "auto") {
-          const embStats = getEmbeddingStats();
-          if (embStats.is_ready) {
-            const embResult = await embeddingSearch(query, { limit, minScore: min_score });
-            if (embResult) {
-              return {
-                content: [{
-                  type: "text",
-                  text: JSON.stringify({
-                    ...embResult,
-                    search_mode: "embedding",
-                    model: embStats.model,
-                  }, null, 2),
-                }],
-              };
-            }
-          }
+      try {
+        // ── Режим keyword ──────────────────────────────────────────────────
+        if (mode === "keyword") {
+          const result = searchInstructions(query, { limit });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({ ...result, search_mode: "keyword" }, null, 2),
+            }],
+          };
         }
 
-        // TF-IDF fallback (или явный mode='semantic')
+        // ── Режим auto / semantic: TF-IDF + cosine ─────────────────────────
         const stats = getIndexStats();
         if (!stats.ready) {
+          // Индекс ещё строится — деградируем в keyword, а не отдаём ошибку
+          const result = searchInstructions(query, { limit });
           return {
             content: [{
               type: "text",
               text: JSON.stringify({
-                error: "Индекс поиска не готов. Подождите несколько секунд после старта сервера.",
-                fallback_hint: "Используйте mode='keyword' для немедленного поиска.",
-                embedding_status: getEmbeddingStats(),
+                ...result,
+                search_mode: "keyword_fallback",
+                note: "TF-IDF индекс ещё строится, использован полнотекстовый поиск.",
               }, null, 2),
             }],
           };
@@ -529,10 +566,17 @@ function registerTools(server) {
         return {
           content: [{
             type: "text",
+            text: JSON.stringify({ ...result, search_mode: "tfidf" }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
             text: JSON.stringify({
-              ...result,
-              search_mode: mode === "auto" ? "tfidf_fallback" : "tfidf",
-              embedding_status: getEmbeddingStats(),
+              error: "SearchFailed",
+              message: err.message,
+              hint: "Попробуйте mode='keyword' или проверьте /health.",
             }, null, 2),
           }],
         };
@@ -1390,102 +1434,71 @@ function registerTools(server) {
 
   server.tool(
     "list_1c_users",
-    "Получает список пользователей из рабочей базы 1С. " +
-    "Возвращает ФИО, логин, должность, подразделение, группы доступа. " +
+    "Список пользователей рабочей базы 1С БЕЗ ФИО. " +
+    "Возвращает: user_uid (ИдентификаторПользователяИБ), подразделение, " +
+    "структурное подразделение, признаки активности. " +
+    "ФИО и логины НЕ передаются — поиск по имени выполняется внутри 1С. " +
+    "Полученный user_uid используйте в get_user_rights и get_user_visas. " +
     "Требует настроенного подключения к 1С (ONEC_URL, ONEC_USERNAME, ONEC_PASSWORD в .env).",
     {
       search: z.string().optional().describe(
-        "Поиск по ФИО или логину (частичное совпадение)"
+        "Поиск по ФИО или логину (частичное совпадение). " +
+        "Выполняется внутри 1С — ФИО в ответе НЕ возвращается, только user_uid."
       ),
       department: z.string().optional().describe(
-        "Фильтр по подразделению"
+        "Фильтр по подразделению (частичное совпадение)"
       ),
       limit: z.number().int().min(1).max(200).default(50).describe(
         "Максимум записей в ответе (по умолчанию 50)"
       ),
       include_inactive: z.boolean().default(false).describe(
-        "Включать неактивных/уволенных пользователей (по умолчанию false)"
+        "Включать недействительных пользователей (по умолчанию false)"
       ),
     },
-    async ({ search, department, limit, include_inactive }) => {
-      try {
-        const result = await callOnecTool("get_users", {
-          search: search || "",
-          department: department || "",
-          limit,
-          include_inactive,
-        });
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source: "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              ...result,
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Для получения списка пользователей используйте инструмент onec_health для диагностики подключения."
-            ),
-          }],
-        };
-      }
-    }
+    onecTool(async ({ search, department, limit, include_inactive }) => {
+      const result = await callOnecTool("get_users", {
+        search: search || "",
+        department: department || "",
+        limit,
+        include_inactive: include_inactive ? "true" : "false",
+      });
+      return liveReply(unwrapOnecPayload(result));
+    }, "Для получения списка пользователей используйте инструмент onec_health для диагностики подключения.")
   );
 
   // ── 14: get_1c_access_groups ───────────────────────────────────────────────
 
   server.tool(
     "get_1c_access_groups",
-    "Получает группы доступа из рабочей базы 1С и назначенных пользователей. " +
-    "Позволяет узнать реальные роли конкретного сотрудника или все группы в системе. " +
+    "Группы доступа рабочей базы 1С: наименование, профиль, количество участников. " +
+    "Опционально — список ролей профиля (include_roles=true). " +
+    "Можно отфильтровать по названию группы или по user_uid конкретного сотрудника. " +
+    "ФИО участников НЕ передаётся — только количество. " +
     "Требует настроенного подключения к 1С.",
     {
-      user_login: z.string().optional().describe(
-        "Логин пользователя 1С — вернуть его группы доступа"
+      user_uid: z.string().optional().describe(
+        "ИдентификаторПользователяИБ (UUID) — вернуть только группы этого пользователя. " +
+        "Получить UID можно через list_1c_users."
       ),
       group_name: z.string().optional().describe(
         "Фильтр по названию группы доступа (частичное совпадение)"
       ),
       include_roles: z.boolean().default(false).describe(
-        "Включать список ролей каждой группы (может увеличить ответ)"
+        "Включать список ролей профиля каждой группы (может увеличить ответ)"
+      ),
+      limit: z.number().int().min(1).max(200).default(50).describe(
+        "Максимум групп в ответе (по умолчанию 50)"
       ),
     },
-    async ({ user_login, group_name, include_roles }) => {
-      try {
-        const result = await callOnecTool("get_access_groups", {
-          user_login: user_login || "",
-          group_name: group_name || "",
-          include_roles,
-        });
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source: "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              ...result,
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Используйте onec_health для проверки подключения к 1С."
-            ),
-          }],
-        };
-      }
-    }
+    onecTool(async ({ user_uid, group_name, include_roles, limit }) => {
+      const result = await callOnecTool("get_access_groups", {
+        user_uid: user_uid || "",
+        group_name: group_name || "",
+        include_roles: include_roles ? "true" : "false",
+        limit,
+      });
+      return liveReply(unwrapOnecPayload(result));
+    }, "Используйте onec_health для проверки подключения к 1С.")
   );
 
   // ── 15: execute_1c_query ───────────────────────────────────────────────────
@@ -1509,95 +1522,44 @@ function registerTools(server) {
         "Максимум строк результата (по умолчанию 100, максимум 1000)"
       ),
     },
-    async ({ query_text, params, limit }) => {
-      // Защита от изменяющих конструкций: инструмент заявлен как read-only.
-      // Проверяем до отправки в 1С — не полагаемся на защиту внутри расширения.
-      const FORBIDDEN = [
-        "УНИЧТОЖИТЬ", "DROP",
-        "ИЗМЕНИТЬ", "ALTER",
-        "УДАЛИТЬ", "DELETE",
-        "ВСТАВИТЬ", "INSERT",
-        "ОБНОВИТЬ", "UPDATE",
-      ];
-      const upper = query_text.toUpperCase();
-      const hit = FORBIDDEN.find((kw) => new RegExp(`(^|[^А-ЯA-Z])${kw}([^А-ЯA-Z]|$)`).test(upper));
-      if (hit) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              error: "ReadOnlyViolation",
-              message: `Запрос содержит изменяющую конструкцию '${hit}'. ` +
-                       `Инструмент допускает только запросы на чтение (ВЫБРАТЬ).`,
-              requested_query: query_text,
-            }, null, 2),
-          }],
-        };
+    // Проверка read-only выполняется ВНУТРИ 1С (ПроверитьЗапросТолькоЧтение в BSL).
+    // Дублирующая JS-проверка была удалена намеренно:
+    //   1) BSL — единственная реальная граница доверия (там же подставляются params);
+    //   2) BSL корректно вырезает строковые литералы, поэтому легитимный запрос
+    //      ВЫБРАТЬ ... ГДЕ Комментарий = "Удалить после проверки" не отклоняется;
+    //   3) два списка запрещённых слов неизбежно расходились при правках.
+    onecTool(async ({ query_text, params, limit }) => {
+      // Инструмент появляется в расширении не во всех версиях — если его нет,
+      // сообщаем об этом явно, а не отдаём криптовую ошибку JSON-RPC.
+      const available = await listOnecTools();
+      const names = (available?.tools || []).map((t) => t.name);
+      if (!names.includes("execute_query")) {
+        return errorReply(
+          "NotSupported",
+          "Установленная версия расширения MCP_Сервер.cfe не содержит инструмент " +
+          "execute_query. Обновите расширение в базе и перезапустите сеансы 1С.",
+          {
+            requested_query: query_text,
+            onec_url: getOnecConfig().url,
+            available_1c_tools: names,
+            alternatives: [
+              "get_visa_routes — визы, маршруты, права, шаги алгоритма, граф маршрута",
+              "get_1c_metadata — список объектов и структура",
+            ],
+          }
+        );
       }
 
-      try {
-        // Инструмент появляется в расширении не во всех версиях — если его нет,
-        // сообщаем об этом явно, а не отдаём криптовую ошибку JSON-RPC.
-        const available = await listOnecTools();
-        const names = (available?.tools || []).map((t) => t.name);
-        if (!names.includes("execute_query")) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                error: "NotSupported",
-                message:
-                  "Установленная версия расширения MCP_Сервер.cfe не содержит инструмент " +
-                  "execute_query. Обновите расширение в базе и перезапустите сеансы 1С.",
-                requested_query: query_text,
-                onec_url: getOnecConfig().url,
-                available_1c_tools: names,
-                alternatives: [
-                  "get_visa_routes — визы, маршруты, права, шаги алгоритма, граф маршрута",
-                  "get_1c_metadata — список объектов и структура",
-                ],
-              }, null, 2),
-            }],
-          };
-        }
+      const result = await callOnecTool("execute_query", {
+        query: query_text,
+        query_text,
+        params: params || {},
+        limit,
+      });
 
-        const result = await callOnecTool("execute_query", {
-          query: query_text,
-          query_text,
-          params: params || {},
-          limit,
-        });
-
-        // Расширение отдаёт результат текстом внутри content[0].text — разбираем
-        let payload = result;
-        const rawText = result?.content?.[0]?.text;
-        if (typeof rawText === "string") {
-          try { payload = JSON.parse(rawText); } catch { payload = { result: rawText }; }
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source: "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              query: query_text,
-              ...payload,
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Проверьте синтаксис запроса. Используйте get_1c_metadata чтобы узнать " +
-              "правильные имена таблиц и полей."
-            ),
-          }],
-        };
-      }
-    }
+      return liveReply(unwrapOnecPayload(result), { query: query_text });
+    }, "Проверьте синтаксис запроса. Используйте get_1c_metadata чтобы узнать " +
+       "правильные имена таблиц и полей.")
   );
 
   // ── 16: get_1c_metadata ────────────────────────────────────────────────────
@@ -1623,8 +1585,11 @@ function registerTools(server) {
       include_attributes: z.boolean().default(false).describe(
         "Включать реквизиты объектов (по умолчанию false — только список объектов)"
       ),
+      max_structures: z.number().int().min(1).max(30).default(10).describe(
+        "Сколько объектов догружать со структурой при include_attributes=true (по умолчанию 10)"
+      ),
     },
-    async ({ object_type, object_name, include_attributes }) => {
+    async ({ object_type, object_name, include_attributes, max_structures }) => {
       try {
         // Расширение предоставляет два инструмента вместо одного get_metadata:
         //   list_metadata_objects  — список объектов по типу и маске имени
@@ -1640,16 +1605,38 @@ function registerTools(server) {
         };
         const metaTypes = TYPE_MAP[object_type] || TYPE_MAP.all;
 
-        // 1. Собираем список объектов по каждому типу метаданных
+        // Общий дедлайн на весь инструмент — иначе при object_type="all"
+        // последовательные запросы могли суммарно превысить таймаут MCP-клиента.
+        const DEADLINE_MS = Number(process.env.ONEC_TOOL_DEADLINE || 60_000);
+        const deadline = Date.now() + DEADLINE_MS;
+        const timeLeft = () => deadline - Date.now();
+
+        // 1. Список объектов — все типы ПАРАЛЛЕЛЬНО (запросы независимы)
+        const listResults = await Promise.all(
+          metaTypes.map(async (metaType) => {
+            try {
+              const listed = await callOnecTool("list_metadata_objects", {
+                metaType,
+                nameMask: object_name || "",
+                maxItems: 200,
+              });
+              const raw = unwrapOnecPayload(listed);
+              const text = typeof raw === "string" ? raw : (raw?.raw ?? listed?.content?.[0]?.text ?? "");
+              return { metaType, text: String(text), error: null };
+            } catch (e) {
+              return { metaType, text: "", error: e.message };
+            }
+          })
+        );
+
         const objects = [];
-        for (const metaType of metaTypes) {
-          const listed = await callOnecTool("list_metadata_objects", {
-            metaType,
-            nameMask: object_name || "",
-            maxItems: 200,
-          });
-          const raw = listed?.content?.[0]?.text ?? "";
-          for (const line of String(raw).split("\n").map((s) => s.trim()).filter(Boolean)) {
+        const listErrors = [];
+        for (const { metaType, text, error } of listResults) {
+          if (error) {
+            listErrors.push({ meta_type: metaType, error });
+            continue;
+          }
+          for (const line of text.split("\n").map((s) => s.trim()).filter(Boolean)) {
             // Формат строки: "Справочник.Контрагенты (Контрагенты)"
             const m = line.match(/^(\S+)\s*(?:\((.*)\))?$/);
             objects.push({
@@ -1661,47 +1648,55 @@ function registerTools(server) {
           }
         }
 
-        // 2. При include_attributes догружаем структуру (ограниченно — запрос на объект)
+        // 2. При include_attributes догружаем структуры — тоже ПАРАЛЛЕЛЬНО
         let structures;
+        let structuresTruncated = false;
         if (include_attributes && objects.length > 0) {
-          const MAX_STRUCTURES = 10;
-          structures = [];
-          for (const obj of objects.slice(0, MAX_STRUCTURES)) {
-            try {
-              const st = await callOnecTool("get_metadata_structure", {
-                metaType: obj.meta_type,
-                name: obj.name,
-              });
+          const batch = objects.slice(0, max_structures);
+
+          if (timeLeft() <= 0) {
+            structures = [{
+              note: "Дедлайн исчерпан на этапе получения списка — структуры не загружены. " +
+                    "Уточните object_name или задайте object_type вместо 'all'.",
+            }];
+          } else {
+            structures = await Promise.all(
+              batch.map(async (obj) => {
+                try {
+                  const st = await callOnecTool("get_metadata_structure", {
+                    metaType: obj.meta_type,
+                    name: obj.name,
+                  });
+                  return {
+                    full_name: obj.full_name,
+                    structure: st?.content?.[0]?.text ?? st,
+                  };
+                } catch (e) {
+                  return { full_name: obj.full_name, error: e.message };
+                }
+              })
+            );
+
+            if (objects.length > max_structures) {
+              structuresTruncated = true;
               structures.push({
-                full_name: obj.full_name,
-                structure: st?.content?.[0]?.text ?? st,
+                note: `Структуры загружены только для первых ${max_structures} объектов из ${objects.length}. ` +
+                      `Уточните object_name или увеличьте max_structures (до 30).`,
               });
-            } catch (e) {
-              structures.push({ full_name: obj.full_name, error: e.message });
             }
-          }
-          if (objects.length > MAX_STRUCTURES) {
-            structures.push({
-              note: `Структуры загружены только для первых ${MAX_STRUCTURES} объектов из ${objects.length}. ` +
-                    `Уточните object_name чтобы сузить выборку.`,
-            });
           }
         }
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source: "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              object_type,
-              filter: object_name || null,
-              count: objects.length,
-              objects,
-              ...(structures ? { structures } : {}),
-            }, null, 2),
-          }],
-        };
+        return liveReply({
+          object_type,
+          filter: object_name || null,
+          count: objects.length,
+          objects,
+          ...(structures ? { structures } : {}),
+          ...(structuresTruncated ? { structures_truncated: true } : {}),
+          ...(listErrors.length ? { list_errors: listErrors } : {}),
+          elapsed_ms: DEADLINE_MS - timeLeft(),
+        });
       } catch (err) {
         return {
           content: [{
@@ -1721,13 +1716,16 @@ function registerTools(server) {
     "get_1c_documents",
     "Получает документы из рабочей базы 1С:БИТ.ФИНАНС — путевые листы, " +
     "платёжные поручения, заявки на оплату, расходные ордера на ГСМ и т.д. " +
+    "Возвращает универсальные поля шапки: номер, дата, проведён, пометка удаления, " +
+    "тип документа, а также организация / контрагент / сумма — если такие реквизиты " +
+    "есть у данного типа (см. fields_available в ответе). " +
     "Поддерживает фильтрацию по типу документа, периоду, статусу, контрагенту. " +
     "Требует настроенного подключения к 1С.",
     {
       document_type: z.string().describe(
         "Тип документа на языке метаданных 1С. Например: " +
-        "'ПутевойЛист', 'ЗаявкаНаОплату', 'ПоступлениеНаСклад', " +
-        "'РасходнаяНакладная', 'РасходОрдерНаГСМ'. " +
+        "'ПутевойЛист', 'бит_мат_ПутевойЛист', 'ЭлектронныйПутевойЛист'. " +
+        "Принимается как 'ПутевойЛист', так и 'Документ.ПутевойЛист'. " +
         "Используйте get_1c_metadata для получения доступных типов."
       ),
       date_from: z.string().optional().describe(
@@ -1746,41 +1744,21 @@ function registerTools(server) {
         "Максимум документов в ответе (по умолчанию 50)"
       ),
     },
-    async ({ document_type, date_from, date_to, status, counterparty, limit }) => {
-      try {
-        const result = await callOnecTool("get_documents", {
-          document_type,
-          date_from: date_from || "",
-          date_to: date_to || "",
-          status: status || "",
-          counterparty: counterparty || "",
-          limit,
-        });
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source: "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              document_type,
-              filters: { date_from, date_to, status, counterparty },
-              ...result,
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Используйте get_1c_metadata для уточнения имени типа документа, " +
-              "или onec_health для проверки подключения."
-            ),
-          }],
-        };
-      }
-    }
+    onecTool(async ({ document_type, date_from, date_to, status, counterparty, limit }) => {
+      const result = await callOnecTool("get_documents", {
+        document_type,
+        date_from: date_from || "",
+        date_to: date_to || "",
+        status: status || "",
+        counterparty: counterparty || "",
+        limit,
+      });
+      return liveReply(unwrapOnecPayload(result), {
+        document_type,
+        filters: { date_from, date_to, status, counterparty },
+      });
+    }, "Используйте get_1c_metadata для уточнения имени типа документа, " +
+       "или onec_health для проверки подключения.")
   );
 
   // ── 18: get_visa_routes ────────────────────────────────────────────────────
@@ -1836,63 +1814,42 @@ function registerTools(server) {
         "Максимум строк в ответе (по умолчанию 50, максимум 200)."
       ),
     },
-    async ({ mode, visa_code, document_type, status_filter, date_from, date_to, algorithm_code, limit }) => {
-      try {
-        const result = await callOnecTool("get_visa_routes", {
-          mode,
-          visa_code:      visa_code      || "",
-          document_type:  document_type  || "",
-          status_filter:  status_filter  || "all",
-          date_from:      date_from      || "",
-          date_to:        date_to        || "",
-          algorithm_code: algorithm_code || "",
-          limit,
-        });
+    onecTool(async ({ mode, visa_code, document_type, status_filter, date_from, date_to, algorithm_code, limit }) => {
+      const result = await callOnecTool("get_visa_routes", {
+        mode,
+        visa_code:      visa_code      || "",
+        document_type:  document_type  || "",
+        status_filter:  status_filter  || "all",
+        date_from:      date_from      || "",
+        date_to:        date_to        || "",
+        algorithm_code: algorithm_code || "",
+        limit,
+      });
 
-        // Расширение возвращает JSON строкой внутри content[0].text — разбираем,
-        // чтобы отдать агенту структуру, а не строку в строке.
-        let payload = result;
-        const rawText = result?.content?.[0]?.text;
-        if (typeof rawText === "string") {
-          try { payload = JSON.parse(rawText); } catch { payload = { raw: rawText }; }
-        }
+      // Расширение возвращает JSON строкой внутри content[0].text — разбираем,
+      // чтобы отдать агенту структуру, а не строку в строке.
+      const payload = unwrapOnecPayload(result);
 
-        // Для блок-схемы дополнительно рендерим Mermaid
-        let diagrams;
-        if (mode === "route_graph" && Array.isArray(payload?.graphs)) {
-          diagrams = payload.graphs.map((g) => ({
-            algorithm_code: g.algorithm_code,
-            algorithm_name: g.algorithm_name,
-            mermaid: renderRouteMermaid(g),
-          }));
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source:   "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              mode,
-              filters: { visa_code, document_type, status_filter, date_from, date_to, algorithm_code },
-              ...payload,
-              ...(diagrams ? { diagrams } : {}),
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Проверьте правильность параметров. " +
-              "Используйте onec_health для диагностики подключения к 1С. " +
-              "Убедитесь что расширение MCP_Сервер.cfe обновлено (содержит get_visa_routes)."
-            ),
-          }],
-        };
+      // Для блок-схемы дополнительно рендерим Mermaid
+      let diagrams;
+      if (mode === "route_graph" && Array.isArray(payload?.graphs)) {
+        diagrams = payload.graphs.map((g) => ({
+          algorithm_code: g.algorithm_code,
+          algorithm_name: g.algorithm_name,
+          mermaid: renderRouteMermaid(g),
+        }));
       }
-    }
+
+      return liveReply(
+        { ...payload, ...(diagrams ? { diagrams } : {}) },
+        {
+          mode,
+          filters: { visa_code, document_type, status_filter, date_from, date_to, algorithm_code },
+        }
+      );
+    }, "Проверьте правильность параметров. " +
+       "Используйте onec_health для диагностики подключения к 1С. " +
+       "Убедитесь что расширение MCP_Сервер.cfe обновлено (содержит get_visa_routes).")
   );
 
   // ── 19: get_user_rights ────────────────────────────────────────────────────
@@ -1923,42 +1880,44 @@ function registerTools(server) {
         "Максимум групп доступа в ответе (по умолчанию 50)."
       ),
     },
-    async ({ user_ref, include_access_values, limit }) => {
-      try {
-        const result = await callOnecTool("get_user_rights", {
-          user_ref,
-          include_access_values: include_access_values || "false",
-          limit,
-        });
+    onecTool(async ({ user_ref, include_access_values, limit }) => {
+      const result = await callOnecTool("get_user_rights", {
+        user_ref,
+        include_access_values: include_access_values || "false",
+        limit,
+      });
+      return liveReply(unwrapOnecPayload(result));
+    }, "Проверьте формат user_ref: 'Справочник.Пользователи?ref=<hex>'. " +
+       "hex — 32-символьный шестнадцатеричный идентификатор объекта в базе 1С.")
+  );
 
-        let payload = result;
-        const rawText = result?.content?.[0]?.text;
-        if (typeof rawText === "string") {
-          try { payload = JSON.parse(rawText); } catch { payload = { raw: rawText }; }
-        }
+  // ── 20: get_user_visas ──────────────────────────────────────────────────────
+  //
+  // Визы согласования пользователя через его группы доступа.
+  // Принимает ИдентификаторПользователяИБ. Все вычисления внутри 1С.
+  // ФИО не передаётся.
+  //
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              source:   "1C:БИТ.ФИНАНС (живая база)",
-              onec_url: getOnecConfig().url,
-              ...payload,
-            }, null, 2),
-          }],
-        };
-      } catch (err) {
-        return {
-          content: [{
-            type: "text",
-            text: formatOnecError(err,
-              "Проверьте формат user_ref: 'Справочник.Пользователи?ref=<hex>'. " +
-              "hex — 32-символьный шестнадцатеричный идентификатор объекта в базе 1С."
-            ),
-          }],
-        };
-      }
-    }
+  server.tool(
+    "get_user_visas",
+    "Возвращает визы согласования пользователя 1С через его группы доступа. " +
+    "Принимает ИдентификаторПользователяИБ (UUID). Все вычисления внутри 1С — " +
+    "ФИО и персональные данные НЕ передаются. " +
+    "Показывает: название визы, литеру, условие назначения, замещаемого. " +
+    "Требует настроенного подключения к 1С и расширения MCP_Сервер.cfe.",
+    {
+      user_uid: z.string().describe(
+        "ИдентификаторПользователяИБ в формате UUID с дефисами. " +
+        "Например: '490933bc-311e-41d5-bcc4-eeb4b996ebf5'. " +
+        "ФИО не передаётся — только анонимный идентификатор."
+      ),
+    },
+    onecTool(async ({ user_uid }) => {
+      const result = await callOnecTool("get_user_visas", { user_uid });
+      return liveReply(unwrapOnecPayload(result));
+    }, "Проверьте формат user_uid: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'. " +
+       "Получить UID: execute_1c_query → ВЫБРАТЬ ИдентификаторПользователяИБ " +
+       "ИЗ Справочник.Пользователи ГДЕ Наименование ПОДОБНО '%Имя%'")
   );
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2016,19 +1975,18 @@ function registerTools(server) {
         r.toLowerCase().includes(query)
       );
 
-      // 4. Определить уровень согласования по найденным функциям
-      const requiresAccounting = foundInFunctions.some((f) => f.requires_chief_accountant);
-      const requiresTransport = foundInFunctions.some((f) => f.requires_transport_head);
-      const approvalRequired =
-        requiresAccounting && requiresTransport
-          ? "transport_accounting"
-          : requiresAccounting
-          ? "accounting"
-          : requiresTransport
-          ? "transport"
-          : foundInFunctions.length > 0 || foundInProfiles.length > 0
-          ? "standard"
-          : null;
+      // 4. Определить уровень согласования по найденным функциям.
+      // Используем каноническую computeApprovalLevel из rbac_matrix — раньше
+      // здесь была своя тернарная лесенка БЕЗ ветки procurement, из-за чего
+      // search_by_role и analyze_roles давали разный ответ для одних и тех же ролей.
+      const hasMatch = foundInFunctions.length > 0 || foundInProfiles.length > 0;
+      const approvalRequired = hasMatch
+        ? computeApprovalLevel({
+            requires_chief_accountant:     foundInFunctions.some((f) => f.requires_chief_accountant),
+            requires_transport_head:       foundInFunctions.some((f) => f.requires_transport_head),
+            requires_procurement_director: foundInFunctions.some((f) => f.requires_procurement_director),
+          })
+        : null;
 
       const totalMatches = foundInFunctions.length + foundInProfiles.length + (isMandatory ? 1 : 0);
 
@@ -2391,24 +2349,10 @@ function registerTools(server) {
           canDo.push(profile.description);
         }
 
-        // Уровень согласования
-        const reqAccounting = profile.requires_chief_accountant;
-        const reqTransport = profile.requires_transport_head;
-        const reqProcurement = profile.requires_procurement_director || false;
-        const approvalLevel =
-          reqAccounting && reqTransport
-            ? "transport_accounting"
-            : reqAccounting
-            ? "accounting"
-            : reqTransport
-            ? "transport"
-            : reqProcurement
-            ? "procurement"
-            : "standard";
-        const approvers = ["Линейный руководитель"];
-        if (reqAccounting) approvers.push("Главный бухгалтер");
-        if (reqTransport) approvers.push("Руководитель АТ");
-        if (reqProcurement) approvers.push("Директор по закупкам");
+        // Уровень согласования — через каноническую пару функций из rbac_matrix,
+        // чтобы формулировки согласующих совпадали с остальными инструментами.
+        const approvalLevel = computeApprovalLevel(profile);
+        const approvers     = formatApprovers(profile);
 
         const step = {
           profile_id: profile.id,
@@ -2730,6 +2674,19 @@ async function reloadKnowledgeBase(reason = "manual") {
   const start = Date.now();
   try {
     const docs = loadKnowledgeBase();   // из knowledge_base.js, возвращает полные объекты с tokens
+
+    // Пустой каталог оставил бы систему в рассогласованном состоянии:
+    // INSTRUCTION_DOCS уже пуст, а старый TF-IDF индекс ещё жив —
+    // semantic-поиск возвращал бы результаты по несуществующим документам.
+    if (docs.length === 0) {
+      log(`⚠️  Перезагрузка (${reason}): каталог пуст, изменения не применены`);
+      return {
+        success: false,
+        error: "Каталог инструкций пуст — перезагрузка отменена, старый индекс сохранён",
+        docs_count: 0,
+      };
+    }
+
     // Пересчитываем TF-IDF индекс после загрузки (buildTfidfIndex также сбрасывает searchCache)
     buildTfidfIndex(docs);
     lastReloadAt = new Date().toISOString();
@@ -2737,15 +2694,12 @@ async function reloadKnowledgeBase(reason = "manual") {
     const idxStats = getIndexStats();
     log(`✅ База знаний перезагружена (${reason}): ${docs.length} инструкций, vocab=${idxStats.vocab_size} за ${elapsed}ms`);
 
-    // Обновляем embedding-индекс в фоне (не блокируем перезагрузку)
-    buildEmbeddingIndex(docs).then((embResult) => {
-      if (embResult.is_ready) {
-        log(`🧠 Embedding-индекс обновлён: ${embResult.docs_count} документов`);
-      }
-    }).catch(() => {}); // Ошибки уже логируются внутри buildEmbeddingIndex
-
     // Сброс кэша маршрутов согласования
-    try { reloadRoutesDb(); } catch (_) { /* routes_db.json может быть не изменён */ }
+    try {
+      reloadRoutesDb();
+    } catch (err) {
+      log(`⚠️  Не удалось перезагрузить routes_db.json: ${err.message}`);
+    }
 
     return { success: true, docs_count: docs.length, elapsed_ms: elapsed, reloaded_at: lastReloadAt, index: idxStats };
   } catch (err) {
@@ -2796,35 +2750,14 @@ app.get("/health", async (req, res) => {
     status: "ok",
     server: "gti-1c-mcp",
     version: "3.0.0",
-    tools_count: 20,
-    tools: [
-      // База знаний (объединено: было 5 → стало 3)
-      "list_instructions",          // фильтры: code, keyword, topic, list_topics
-      "search_instructions",        // mode: auto | semantic | keyword
-      "get_instruction",
-      // Профили доступа RBAC (объединено: было 6 → стало 6)
-      "suggest_access_profile",     // + generate_request_text
-      "get_roles_matrix",
-      "analyze_roles",              // объединяет validate_roles + get_approval_level
-      "explain_profile",
-      "search_by_role",
-      "get_profiles_by_function",
-      // Маппинг должность → профили
-      "suggest_profile_by_job",     // + include_explanation
-      "list_jobs",
-      // Связка инструкция ↔ доступ
-      "get_instruction_access_requirements",  // + topic-маппинг
-      "get_user_access_journey",              // + data_quality
-      // Живая база 1С
-      "onec_health",               // кэш 60 сек
-      "list_1c_users",
-      "get_1c_access_groups",
-      "execute_1c_query",
-      "get_1c_metadata",
-      "get_1c_documents",
-      "get_visa_routes",           // визы, маршруты, права, алгоритмы (живые данные)
-      "get_user_rights",           // группы доступа + профили по ссылке user_ref (без ФИО)
-    ],
+    tools_count: TOOL_GROUPS_FLAT.length,
+    tools: TOOL_GROUPS_FLAT,
+    tool_groups: TOOL_GROUPS,
+    sessions: {
+      active: sessions.size,
+      max: MAX_SESSIONS,
+      ttl_minutes: Math.round(SESSION_TTL_MS / 60000),
+    },
     profiles_count: ACCESS_PROFILES.length,
     knowledge_base: {
       loaded: true,
@@ -2834,7 +2767,6 @@ app.get("/health", async (req, res) => {
     },
     tfidf_index: getIndexStats(),
     search_cache: getSearchCacheStats(),
-    embedding_index: getEmbeddingStats(),
     job_profiles: {
       loaded: true,
       total_jobs: Object.keys(JOB_PROFILES_MAP).length,
@@ -2861,13 +2793,8 @@ app.get("/", (req, res) => {
     health: `http://HOST:${PORT}/health`,
     auth_header: "X-MCP-Token: <token>",
     docs: "Добавьте в клиент MCP: Remote → URL: http://localhost:3031/mcp, Header: X-MCP-Token: <token>",
-    tool_groups: {
-      knowledge_base:  ["list_instructions", "search_instructions", "get_instruction"],
-      rbac_profiles:   ["suggest_access_profile", "get_roles_matrix", "analyze_roles", "explain_profile", "search_by_role", "get_profiles_by_function"],
-      job_mapping:     ["suggest_profile_by_job", "list_jobs"],
-      access_journey:  ["get_instruction_access_requirements", "get_user_access_journey"],
-      live_1c:         ["onec_health", "list_1c_users", "get_1c_access_groups", "execute_1c_query", "get_1c_metadata", "get_1c_documents", "get_visa_routes", "get_user_rights"],
-    },
+    tools_count: TOOL_GROUPS_FLAT.length,
+    tool_groups: TOOL_GROUPS,
     onec_integration: {
       configured: onecCfg.configured,
       url: onecCfg.url || "(не настроено)",
@@ -2880,7 +2807,37 @@ app.get("/", (req, res) => {
 // ── Stateful Streamable HTTP (SDK 1.12+) ─────────────────────────────────────
 // Каждая сессия — отдельный McpServer + StreamableHTTPServerTransport
 
-const sessions = new Map(); // sessionId → { transport }
+const sessions = new Map(); // sessionId → { transport, lastActivity }
+
+// Сессия держит отдельный экземпляр McpServer со всеми замыканиями инструментов.
+// Раньше запись удалялась только по transport.onclose — при обрыве сети (kill
+// процесса клиента, потеря соединения) она оставалась в Map навсегда.
+const SESSION_TTL_MS   = Number(process.env.MCP_SESSION_TTL || 30 * 60_000); // 30 мин
+const SESSION_SWEEP_MS = Number(process.env.MCP_SESSION_SWEEP || 5 * 60_000); // 5 мин
+const MAX_SESSIONS     = Number(process.env.MCP_MAX_SESSIONS || 100);
+
+function closeSession(sid, reason) {
+  const entry = sessions.get(sid);
+  if (!entry) return;
+  sessions.delete(sid);
+  try {
+    entry.transport.close?.();
+  } catch (err) {
+    log(`⚠️  Ошибка закрытия сессии ${sid}: ${err.message}`);
+  }
+  log(`🧹 Сессия ${sid} закрыта (${reason}), активных: ${sessions.size}`);
+}
+
+// Периодическая чистка протухших сессий
+const sessionSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [sid, entry] of sessions) {
+    if (now - entry.lastActivity > SESSION_TTL_MS) {
+      closeSession(sid, `неактивна >${Math.round(SESSION_TTL_MS / 60000)} мин`);
+    }
+  }
+}, SESSION_SWEEP_MS);
+sessionSweeper.unref?.(); // не держим event loop открытым из-за таймера
 
 app.all("/mcp", async (req, res) => {
   try {
@@ -2888,8 +2845,9 @@ app.all("/mcp", async (req, res) => {
 
     // Переиспользуем существующую сессию
     if (sessionId && sessions.has(sessionId)) {
-      const { transport } = sessions.get(sessionId);
-      await transport.handleRequest(req, res, req.body);
+      const entry = sessions.get(sessionId);
+      entry.lastActivity = Date.now();
+      await entry.transport.handleRequest(req, res, req.body);
       return;
     }
 
@@ -2903,15 +2861,25 @@ app.all("/mcp", async (req, res) => {
       return;
     }
 
+    // Защита от неограниченного роста: вытесняем самую старую сессию
+    if (sessions.size >= MAX_SESSIONS) {
+      let oldestId = null;
+      let oldestAt = Infinity;
+      for (const [sid, entry] of sessions) {
+        if (entry.lastActivity < oldestAt) { oldestAt = entry.lastActivity; oldestId = sid; }
+      }
+      if (oldestId) closeSession(oldestId, `достигнут лимит ${MAX_SESSIONS} сессий`);
+    }
+
     // Создаём транспорт
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
-        sessions.set(id, { transport });
+        sessions.set(id, { transport, lastActivity: Date.now() });
       },
     });
 
-    // Удаляем сессию при закрытии
+    // Удаляем сессию при штатном закрытии
     transport.onclose = () => {
       const sid = transport.sessionId;
       if (sid) sessions.delete(sid);
@@ -2947,30 +2915,27 @@ app.all("/mcp", async (req, res) => {
  *   1. loadKnowledgeBase()   — читает .md файлы, стеммирует токены
  *   2. buildTfidfIndex(docs) — строит TF-IDF индекс
  *
- * Асинхронно в фоне (не блокируют старт):
- *   3. buildEmbeddingIndex() — загружает ONNX-модель, строит эмбеддинги
- *   4. reloadRoutesDb()      — разбирает routes_db.json в память
+ * Асинхронно в фоне (не блокирует старт):
+ *   3. reloadRoutesDb()      — разбирает routes_db.json в память
  */
 function initAll() {
   // ── 1+2: KB + TF-IDF (синхронно, один вызов loadKnowledgeBase) ──
   let tfidfStats = null;
+  const t0 = Date.now();
   try {
     const allDocs = loadKnowledgeBase();
-    buildTfidfIndex(allDocs);
-    tfidfStats = getIndexStats();
+    if (allDocs.length === 0) {
+      log(`⚠️  База знаний пуста — проверьте каталог knowledge/instructions`);
+    } else {
+      buildTfidfIndex(allDocs);
+      tfidfStats = getIndexStats();
+      log(`📚 База знаний: ${allDocs.length} инструкций, индекс за ${Date.now() - t0}мс`);
+    }
   } catch (err) {
     log(`⚠️  TF-IDF индекс не построен: ${err.message}`);
   }
 
-  // ── 3: Embedding-индекс — фоновая задача, не блокирует ──────────
-  // getLoadedDocs() возвращает уже загруженный массив — без повторного чтения диска
-  buildEmbeddingIndex(getLoadedDocs()).then((embResult) => {
-    if (embResult.is_ready) {
-      log(`🧠 Embedding-индекс готов: ${embResult.docs_count} документов`);
-    }
-  }).catch(() => {}); // ошибки уже логируются внутри buildEmbeddingIndex
-
-  // ── 4: Routes DB — предзагружаем в фоне через setImmediate ──────
+  // ── 3: Routes DB — предзагружаем в фоне через setImmediate ──────
   setImmediate(() => {
     try {
       reloadRoutesDb();
@@ -2987,6 +2952,10 @@ function initAll() {
 // В этом режиме HTTP-сервер не запускается; весь обмен идёт через stdin/stdout.
 
 if (!process.stdin.isTTY) {
+  // Инициализация ДО connect(): пока идёт чтение и стемминг 1.5 МБ,
+  // клиент не должен получать ответы по неготовому индексу.
+  const stats = initAll();
+
   const server = new McpServer({
     name: "gti-1c-mcp",
     version: "1.0.0",
@@ -2995,9 +2964,6 @@ if (!process.stdin.isTTY) {
 
   const transport = new StdioServerTransport();
   server.connect(transport).then(() => {
-    // Инициализируем всё после подключения — KB + TF-IDF синхронно,
-    // embedding + routes в фоне
-    const stats = initAll();
     process.stderr.write(
       `[gti-1c-mcp] stdio-режим запущен. Профилей: ${ACCESS_PROFILES.length}, ` +
       `инструкций: ${listInstructions().length}` +
@@ -3010,15 +2976,20 @@ if (!process.stdin.isTTY) {
 
 } else {
   // ── Режим HTTP (для ручного запуска, Docker, remote-подключений) ────────────
+  //
+  // initAll() вызывается ДО app.listen(). Раньше он стоял внутри колбэка listen:
+  // порт уже принимал соединения, но event loop был заблокирован чтением и
+  // стеммингом 1.5 МБ (~450 мс) — все входящие запросы висели в очереди.
+  const stats = initAll();
+
   app.listen(PORT, () => {
     log(`✅ gti-1c-mcp запущен на порту ${PORT}`);
     log(`   MCP endpoint : http://localhost:${PORT}/mcp`);
     log(`   Health-check : http://localhost:${PORT}/health`);
+    log(`   Инструментов : ${TOOL_GROUPS_FLAT.length}`);
     log(`   Профилей     : ${ACCESS_PROFILES.length}`);
     log(`   API Token    : ${API_TOKEN}`);
-    const stats = initAll();
     if (stats) log(`   TF-IDF индекс: ${stats.docs_count} doc, vocab=${stats.vocab_size}`);
     log(`   Инструкций   : ${listInstructions().length}`);
-    log(`   Embedding    : инициализируется в фоне...`);
   });
 }
