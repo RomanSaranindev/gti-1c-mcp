@@ -45,10 +45,12 @@ function _request(url, { method = "GET", headers = {}, body = null, timeout = 30
       headers,
       agent: isHttps ? _tlsAgent : undefined,
     };
+    let hardDeadline = null;
     const req = lib.request(options, (res) => {
       const chunks = [];
       res.on("data", (d) => chunks.push(d));
       res.on("end", () => {
+        clearTimeout(hardDeadline);
         const text = Buffer.concat(chunks).toString("utf8");
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
@@ -58,8 +60,18 @@ function _request(url, { method = "GET", headers = {}, body = null, timeout = 30
         });
       });
     });
-    req.on("error", reject);
+    // Таймаут бездействия сокета: сбрасывается на каждом полученном чанке.
     req.setTimeout(timeout, () => { req.destroy(new Error("timeout")); });
+
+    // Жёсткий дедлайн на ВЕСЬ запрос. Без него медленный ответ 1С,
+    // приходящий по чанку, может держать соединение неограниченно долго.
+    hardDeadline = setTimeout(() => {
+      req.destroy(new Error("hard-deadline"));
+    }, timeout * 2);
+
+    req.on("error", (err) => { clearTimeout(hardDeadline); reject(err); });
+    req.on("close", () => clearTimeout(hardDeadline));
+
     if (body) req.write(body);
     req.end();
   });
@@ -105,7 +117,7 @@ let _requestId = 1;
  * @returns {Promise<object>} — результат (поле result из ответа)
  * @throws {Error} при ошибке сети, 4xx/5xx, или JSON-RPC error
  */
-export async function onecRpc(method, params = {}) {
+async function _onecRpcOnce(method, params = {}) {
   if (!isOnecConfigured()) {
     throw new OnecNotConfiguredError(
       "Подключение к 1С не настроено. " +
@@ -183,6 +195,60 @@ export async function onecRpc(method, params = {}) {
   return json.result;
 }
 
+// ── Retry для транзиентных сбоев ─────────────────────────────────────────────
+//
+// Повторяем только то, что реально может «само пройти»:
+//   OnecNetworkError  — обрыв соединения, перезапуск рабочего процесса 1С
+//   OnecTimeoutError  — кратковременная перегрузка
+//   OnecHttpError 5xx — 502/503/504 от IIS/Apache при перезапуске
+//
+// НЕ повторяем детерминированные ошибки:
+//   OnecAuthError (401), OnecNotFoundError (404), OnecRpcError, OnecParseError,
+//   OnecNotConfiguredError — повтор даст тот же результат.
+
+const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.ONEC_RETRY_ATTEMPTS || "2"));
+const RETRY_BASE_DELAY = Math.max(0, parseInt(process.env.ONEC_RETRY_DELAY || "500"));
+
+function isRetriable(err) {
+  if (err instanceof OnecNetworkError) return true;
+  if (err instanceof OnecTimeoutError) return true;
+  if (err instanceof OnecHttpError) {
+    // Код статуса в тексте: "Ошибка HTTP 503 от 1С: ..."
+    const m = /HTTP\s+(\d{3})/.exec(err.message);
+    return m ? Number(m[1]) >= 500 : false;
+  }
+  return false;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Выполняет JSON-RPC запрос к 1С с повторами при транзиентных сбоях.
+ *
+ * @param {string} method — метод JSON-RPC, например "tools/call" или "tools/list"
+ * @param {object} params — параметры запроса
+ * @returns {Promise<object>} — результат (поле result из ответа)
+ */
+export async function onecRpc(method, params = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await _onecRpcOnce(method, params);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === RETRY_ATTEMPTS || !isRetriable(err)) throw err;
+
+      // Экспоненциальный backoff: 500мс → 1500мс
+      const delay = RETRY_BASE_DELAY * Math.pow(3, attempt);
+      process.stderr.write(
+        `[onec_client] ${err.name} при '${method}', повтор ${attempt + 1}/${RETRY_ATTEMPTS} через ${delay}мс\n`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Вызывает инструмент 1С по имени с аргументами.
  * Удобная обёртка над onecRpc для вызова tools/call.
@@ -192,7 +258,39 @@ export async function onecRpc(method, params = {}) {
  * @returns {Promise<object>}
  */
 export async function callOnecTool(toolName, args = {}) {
-  return onecRpc("tools/call", { name: toolName, arguments: args });
+  const result = await onecRpc("tools/call", { name: toolName, arguments: args });
+
+  // Расширение 1С возвращает ошибку инструмента как УСПЕШНЫЙ JSON-RPC result
+  // с флагом isError=true. Без этой проверки агент примет текст ошибки за данные.
+  if (result && result.isError === true) {
+    const text = result?.content?.[0]?.text;
+    const message = typeof text === "string" && text.trim()
+      ? text.trim()
+      : `Инструмент '${toolName}' завершился с ошибкой`;
+    throw new OnecToolError(message, toolName);
+  }
+
+  return result;
+}
+
+/**
+ * Разворачивает MCP-ответ 1С в объект.
+ *
+ * Расширение упаковывает результат в { content: [{ type: "text", text: "<json>" }] }.
+ * Функция извлекает и парсит этот JSON. Если текста нет — возвращает исходный объект,
+ * если текст не парсится как JSON — оборачивает в { raw }.
+ *
+ * @param {object} result — результат callOnecTool
+ * @returns {object}
+ */
+export function unwrapOnecPayload(result) {
+  const rawText = result?.content?.[0]?.text;
+  if (typeof rawText !== "string") return result;
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return { raw: rawText };
+  }
 }
 
 // ── Кэш health-check (TTL 60 сек, сбрасывается при ошибке) ──────────────────
@@ -304,6 +402,19 @@ export class OnecRpcError extends OnecError {
     this.name = "OnecRpcError";
     this.code = code;
     this.data = data;
+  }
+}
+
+/**
+ * Инструмент 1С отработал, но вернул isError=true.
+ * Расширение отдаёт такие ошибки как успешный JSON-RPC result,
+ * поэтому без явной проверки они выглядят как валидные данные.
+ */
+export class OnecToolError extends OnecError {
+  constructor(message, toolName) {
+    super(message);
+    this.name = "OnecToolError";
+    this.toolName = toolName;
   }
 }
 
